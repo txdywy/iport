@@ -82,6 +82,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Normalize IPv6: strip brackets/zone for dial, keep clean for display
+	target = scanner.NormalizeHost(target)
+
 	// Validate concurrency
 	if concurrency < 1 {
 		concurrency = 1
@@ -139,6 +142,16 @@ func main() {
 	}()
 
 	emit := func(r ScanResult) { results <- r }
+
+	// emitBatch sends multiple results atomically — no interleaving from other goroutines.
+	var emitMu sync.Mutex
+	emitBatch := func(batch []ScanResult) {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+		for _, r := range batch {
+			results <- r
+		}
+	}
 
 	ui.PrintHeader(target)
 
@@ -318,9 +331,7 @@ func main() {
 				batch = append(batch, appResults...)
 
 				// Emit entire port batch atomically
-				for _, r := range batch {
-					emit(r)
-				}
+				emitBatch(batch)
 			}(port)
 		}
 		wg.Wait()
@@ -336,9 +347,10 @@ func main() {
 			go func(port string) {
 				defer wg.Done()
 				displays := toDisplays(scanner.RunTCPProbes(target, port, timeout))
-				// Emit section + results as batch
-				emit(ScanResult{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (TCP Port %s)", port)})
-				emit(ScanResult{Kind: "proxy", Port: port, Probes: displays})
+				emitBatch([]ScanResult{
+					{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (TCP Port %s)", port)},
+					{Kind: "proxy", Port: port, Probes: displays},
+				})
 				if len(displays) > 0 {
 					proxyMu.Lock()
 					allProxyResults[port] = displays
@@ -352,8 +364,10 @@ func main() {
 			go func(port string) {
 				defer wg.Done()
 				displays := toDisplays(scanner.RunUDPProbes(target, port, timeout))
-				emit(ScanResult{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (UDP Port %s)", port)})
-				emit(ScanResult{Kind: "proxy", Port: port, Probes: displays})
+				emitBatch([]ScanResult{
+					{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (UDP Port %s)", port)},
+					{Kind: "proxy", Port: port, Probes: displays},
+				})
 				if len(displays) > 0 {
 					proxyMu.Lock()
 					allProxyResults["udp/"+port] = displays

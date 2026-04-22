@@ -137,7 +137,7 @@ func probeBrookWS(host, port string, timeout time.Duration) []ProbeResult {
 	conn.SetDeadline(time.Now().Add(timeout))
 
 	// Brook WSS uses WebSocket upgrade to /ws path
-	req := fmt.Sprintf("GET /ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", host)
+	req := fmt.Sprintf("GET /ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", HostForHTTP(host))
 	conn.Write([]byte(req))
 
 	reader := bufio.NewReader(conn)

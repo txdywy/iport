@@ -61,7 +61,7 @@ func probeTrojan(host, port string, timeout time.Duration) []ProbeResult {
 		}
 		defer conn.Close()
 		conn.SetWriteDeadline(time.Now().Add(shortTimeout))
-		conn.Write([]byte("GET / HTTP/1.1\r\nHost: " + host + "\r\n\r\n"))
+		conn.Write([]byte("GET / HTTP/1.1\r\nHost: " + HostForHTTP(host) + "\r\n\r\n"))
 		resp, _ := readWithTimeout(conn, shortTimeout)
 		ch2 <- probeOut{resp: resp, hasHTTP: len(resp) > 0 && strings.Contains(string(resp), "HTTP/")}
 	}()

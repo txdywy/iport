@@ -58,7 +58,7 @@ func doWSHandshake(conn net.Conn, host, path string, timeout time.Duration, tran
 	wsKey := base64.StdEncoding.EncodeToString(keyBytes)
 
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
-		path, host, wsKey)
+		path, HostForHTTP(host), wsKey)
 	conn.Write([]byte(req))
 
 	reader := bufio.NewReader(conn)
@@ -245,7 +245,7 @@ func probeHTTPUpgrade(host, port string, timeout time.Duration) []ProbeResult {
 		conn.SetDeadline(time.Now().Add(timeout))
 
 		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-			path, host)
+			path, HostForHTTP(host))
 		conn.Write([]byte(req))
 
 		reader := bufio.NewReader(conn)

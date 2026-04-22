@@ -154,12 +154,40 @@ func readWithTimeout(conn net.Conn, timeout time.Duration) ([]byte, error) {
 // URLHost returns a host string safe for use in URLs.
 // IPv6 addresses are wrapped in brackets; for standard ports (80/443) the port is omitted.
 func URLHost(host, port string) string {
-	// Bracket IPv6
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
-	}
+	h := HostForHTTP(host)
 	if port == "80" || port == "443" {
+		return h
+	}
+	return h + ":" + port
+}
+
+// NormalizeHost strips brackets and zone IDs from a host string for use in dial/SNI.
+// "[::1]" → "::1", "fe80::1%lo0" → "fe80::1", "[fe80::1%25lo0]" → "fe80::1"
+func NormalizeHost(host string) string {
+	// Strip brackets
+	if len(host) > 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	// Strip URL-encoded zone (%25...)
+	if i := strings.Index(host, "%25"); i != -1 {
+		host = host[:i]
+	}
+	// Strip raw zone (%...)
+	if i := strings.Index(host, "%"); i != -1 {
+		host = host[:i]
+	}
+	return host
+}
+
+// HostForHTTP returns a host suitable for HTTP Host header and URLs.
+// IPv6 addresses get brackets, regular hosts pass through.
+func HostForHTTP(host string) string {
+	// Already bracketed
+	if len(host) > 0 && host[0] == '[' {
 		return host
 	}
-	return host + ":" + port
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
 }
