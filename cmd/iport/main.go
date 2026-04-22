@@ -89,12 +89,11 @@ func main() {
 	}
 	if website != "" {
 		timeout := time.Duration(timeoutMs) * time.Millisecond
-		diag, err := webcheck.Check(context.Background(), website, webcheck.Options{Timeout: timeout})
+		_, err := webcheck.CheckWithEvents(context.Background(), website, webcheck.Options{Timeout: timeout}, ui.PrintWebEvent)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		ui.PrintWebDiagnosis(diag)
 		os.Exit(0)
 	}
 

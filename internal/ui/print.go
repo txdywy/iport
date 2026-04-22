@@ -252,17 +252,55 @@ func PrintWebDiagnosis(d *webcheck.Diagnosis) {
 	for _, layer := range d.Layers {
 		fmt.Printf("%s\n", sectionSep("─────────────────────────────────────────"))
 		fmt.Printf("\n%s\n", bold("["+layer.Name+"]"))
-		fmt.Printf(" %s Status: %s", statusIcon(layer.Status), statusColor(layer.Status)(layer.Status))
-		if layer.Confidence > 0 {
-			fmt.Printf(" (%d%%)", layer.Confidence)
-		}
-		fmt.Println()
-		if layer.Summary != "" {
-			fmt.Printf("   %s\n", layer.Summary)
-		}
-		printAttempts(layer.Attempts)
+		printWebLayer(layer)
 	}
 	fmt.Println()
+}
+
+func PrintWebEvent(e webcheck.Event) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	switch e.Kind {
+	case webcheck.EventStart:
+		fmt.Printf("\n%s\n", bold("[Website Connectivity Diagnosis]"))
+		fmt.Printf(" %s Target: %s\n", infoColor("•"), infoColor(e.Target.Raw))
+		fmt.Printf(" %s Running layered checks: DNS → TCP → TLS/SNI → HTTP → QUIC\n", dimColor("•"))
+	case webcheck.EventLayerStart:
+		fmt.Printf("%s\n", sectionSep("─────────────────────────────────────────"))
+		fmt.Printf("\n%s\n", bold("["+e.LayerName+"]"))
+		fmt.Printf(" %s Running...\n", infoColor("⏳"))
+	case webcheck.EventLayerResult:
+		printWebLayer(e.Layer)
+	case webcheck.EventFinal:
+		d := e.Diagnosis
+		fmt.Printf("%s\n", sectionSep("─────────────────────────────────────────"))
+		fmt.Printf("\n%s\n", bold("[Verdict]"))
+		fmt.Printf(" %s Overall: %s (%d%%)\n", verdictIcon(d.Overall), verdictColor(d.Overall)(string(d.Overall)), d.Confidence)
+		fmt.Printf(" %s Root Cause: %s\n", infoColor("•"), d.RootCause)
+		if d.Summary != "" {
+			fmt.Printf(" %s %s\n", dimColor("•"), d.Summary)
+		}
+		if len(d.Evidence) > 0 {
+			fmt.Printf(" %s Evidence:\n", infoColor("•"))
+			for _, ev := range d.Evidence {
+				fmt.Printf("   %s\n", ev)
+			}
+		}
+		fmt.Println()
+	}
+}
+
+func printWebLayer(layer webcheck.LayerResult) {
+	fmt.Printf(" %s Status: %s", statusIcon(layer.Status), statusColor(layer.Status)(layer.Status))
+	if layer.Confidence > 0 {
+		fmt.Printf(" (%d%%)", layer.Confidence)
+	}
+	fmt.Println()
+	if layer.Summary != "" {
+		fmt.Printf("   %s\n", layer.Summary)
+	}
+	printAttempts(layer.Attempts)
 }
 
 func printAttempts(attempts []webcheck.Attempt) {

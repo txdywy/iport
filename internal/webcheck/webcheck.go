@@ -78,7 +78,28 @@ type Options struct {
 	Timeout time.Duration
 }
 
+type EventKind string
+
+const (
+	EventStart       EventKind = "start"
+	EventLayerStart  EventKind = "layer-start"
+	EventLayerResult EventKind = "layer-result"
+	EventFinal       EventKind = "final"
+)
+
+type Event struct {
+	Kind      EventKind
+	Target    Target
+	LayerName string
+	Layer     LayerResult
+	Diagnosis *Diagnosis
+}
+
 func Check(ctx context.Context, raw string, opts Options) (*Diagnosis, error) {
+	return CheckWithEvents(ctx, raw, opts, nil)
+}
+
+func CheckWithEvents(ctx context.Context, raw string, opts Options, emit func(Event)) (*Diagnosis, error) {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 2 * time.Second
 	}
@@ -88,9 +109,12 @@ func Check(ctx context.Context, raw string, opts Options) (*Diagnosis, error) {
 	}
 
 	d := &Diagnosis{Target: target, Overall: VerdictInconclusive, RootCause: "unknown", Confidence: 20}
+	emitEvent(emit, Event{Kind: EventStart, Target: target})
 
+	emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "DNS"})
 	dnsLayer, systemIPs, controlIPs := checkDNS(ctx, target.Host, opts.Timeout)
 	d.Layers = append(d.Layers, dnsLayer)
+	emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: dnsLayer})
 
 	testIPs := limitIPs(preferredIPs(controlIPs, systemIPs), maxTestIPs)
 	if len(testIPs) == 0 {
@@ -99,30 +123,41 @@ func Check(ctx context.Context, raw string, opts Options) (*Diagnosis, error) {
 		d.Confidence = 80
 		d.Summary = "No usable A/AAAA records were resolved."
 		d.Evidence = append(d.Evidence, dnsLayer.Summary)
+		emitEvent(emit, Event{Kind: EventFinal, Target: target, Diagnosis: d})
 		return d, nil
 	}
 
+	emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "TCP"})
 	tcpLayer := checkTCP(ctx, testIPs, target.Port, opts.Timeout)
 	d.Layers = append(d.Layers, tcpLayer)
+	emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: tcpLayer})
 
 	tlsLayer := LayerResult{Name: "TLS/SNI", Status: "skipped", Summary: "Target scheme does not require TLS."}
 	if target.Port == "443" {
+		emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "TLS/SNI"})
 		tlsLayer = checkTLS(ctx, target.Host, testIPs, target.Port, opts.Timeout)
 		d.Layers = append(d.Layers, tlsLayer)
+		emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: tlsLayer})
 	}
 
+	emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "HTTP"})
 	httpLayer := checkHTTP(ctx, target, testIPs, opts.Timeout)
 	d.Layers = append(d.Layers, httpLayer)
+	emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: httpLayer})
 	if httpLayer.Status != "ok" && !target.ExplicitURL && target.Scheme == "https" {
 		fallbackTarget := target
 		fallbackTarget.Scheme = "http"
 		fallbackTarget.Port = "80"
+		emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "TCP HTTP fallback"})
 		tcp80Layer := checkTCP(ctx, testIPs, fallbackTarget.Port, opts.Timeout)
 		tcp80Layer.Name = "TCP HTTP fallback"
 		d.Layers = append(d.Layers, tcp80Layer)
+		emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: tcp80Layer})
+		emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "HTTP fallback"})
 		fallbackHTTP := checkHTTP(ctx, fallbackTarget, testIPs, opts.Timeout)
 		fallbackHTTP.Name = "HTTP fallback"
 		d.Layers = append(d.Layers, fallbackHTTP)
+		emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: fallbackHTTP})
 		if fallbackHTTP.Status == "ok" {
 			httpLayer = fallbackHTTP
 		}
@@ -130,12 +165,21 @@ func Check(ctx context.Context, raw string, opts Options) (*Diagnosis, error) {
 
 	quicLayer := LayerResult{Name: "HTTP/3 QUIC/SNI", Status: "skipped", Summary: "QUIC is only checked for HTTPS targets."}
 	if target.Port == "443" {
+		emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "HTTP/3 QUIC/SNI"})
 		quicLayer = checkQUIC(ctx, target.Host, testIPs, opts.Timeout)
 		d.Layers = append(d.Layers, quicLayer)
+		emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: quicLayer})
 	}
 
 	classify(d, dnsLayer, tcpLayer, tlsLayer, httpLayer, quicLayer)
+	emitEvent(emit, Event{Kind: EventFinal, Target: target, Diagnosis: d})
 	return d, nil
+}
+
+func emitEvent(emit func(Event), event Event) {
+	if emit != nil {
+		emit(event)
+	}
 }
 
 func ParseTarget(raw string) (Target, error) {
