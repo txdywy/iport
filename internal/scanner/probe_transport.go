@@ -209,7 +209,7 @@ func probeGRPC(host, port string, timeout time.Duration) []ProbeResult {
 	client := &http.Client{Transport: t, Timeout: timeout}
 
 	for _, svc := range []string{"/grpc", "/GunService/Tun", "/vless", "/vmess"} {
-		url := fmt.Sprintf("https://%s:%s%s", host, port, svc)
+		url := "https://" + URLHost(host, port) + svc
 		req, _ := http.NewRequest("POST", url, nil)
 		req.Header.Set("Content-Type", "application/grpc")
 		req.Header.Set("TE", "trailers")
@@ -273,7 +273,7 @@ func probeXHTTP(host, port string, timeout time.Duration) []ProbeResult {
 
 	// XHTTP typically uses POST with chunked encoding to specific paths
 	for _, path := range []string{"/", "/xhttp", "/post"} {
-		url := fmt.Sprintf("https://%s:%s%s", host, port, path)
+		url := "https://" + URLHost(host, port) + path
 
 		// Try POST — XHTTP servers accept POST and stream response
 		req, _ := http.NewRequest("POST", url, strings.NewReader(""))

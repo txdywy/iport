@@ -9,7 +9,7 @@ A fast, zero-configuration, dependency-free network probe and diagnostic tool.
 - **L3/L4 Connectivity:** Concurrent ICMP Ping and TCP/UDP port checks.
 - **TLS Version Scanning:** Automatically checks support for TLS 1.0, 1.1, 1.2, and 1.3, including cipher suites.
 - **Advanced HTTP Protocols:** Negotiates HTTP/1.1 and HTTP/2 over ALPN, and checks for HTTP/3 (QUIC) support over UDP.
-- **Proxy Protocol Detection:** Actively probes open ports to identify 19+ proxy/tunnel protocols with confidence scoring and transport layer identification.
+- **Proxy Protocol Detection:** Actively probes open ports to identify 25 proxy/tunnel protocols with confidence scoring and transport layer identification.
 - **Zero Configuration:** Sane defaults give you a comprehensive report immediately.
 - **Static Binary:** Built with Go, meaning it's a single binary with no external dependencies (no need for `nmap`, `openssl`, etc.).
 
@@ -44,6 +44,9 @@ iport example.com
 # Specify custom ports
 iport 192.168.1.100 -p 80,443,8080,8443
 
+# TCP only (skip UDP scanning and HTTP/3 check)
+iport example.com -T
+
 # Proxy detection only (skip TLS/HTTP analysis for speed)
 iport 192.168.1.100 -p 443,1080,8388 -probe-only
 
@@ -53,8 +56,11 @@ iport example.com -probe=false
 # List all supported proxy protocol probes
 iport -list-probes
 
-# Scan all ports (proxy detection auto-disabled for performance)
+# Scan all 65535 TCP+UDP ports (proxy detection auto-disabled for performance)
 iport example.com -A
+
+# Scan all ports, TCP only
+iport example.com -A -T
 
 # Adjust timeout (in milliseconds)
 iport example.com -timeout 5000
@@ -68,13 +74,14 @@ iport example.com -A -c 2000
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-t` | | Target IP or domain |
-| `-p` | `80,443` | Ports to scan (comma separated) |
+| `-p` | `80,443` | Ports to scan (comma separated, validated 1-65535) |
 | `-timeout` | `2000` | Timeout in milliseconds |
-| `-A` | `false` | Scan all 65535 TCP ports |
-| `-c` | `1000` | Maximum concurrent port scans |
+| `-A` | `false` | Scan all 65535 TCP+UDP ports |
+| `-T` | `false` | TCP only, skip UDP scanning and HTTP/3 |
+| `-c` | `1000` | Maximum concurrent scans |
 | `-probe` | `true` | Enable proxy protocol detection |
 | `-probe-only` | `false` | Skip TLS/HTTP, only run proxy probes |
-| `-list-probes` | `false` | List supported protocols and exit |
+| `-list-probes` | `false` | List all 25 supported protocol probes and exit |
 | `-V` | `false` | Show version and exit |
 
 ## Example Output
@@ -86,10 +93,15 @@ iport example.com -A -c 2000
  🟢 ICMP Ping: RTT: 2.1ms
  🟢 TCP Port 443: Open
  🟢 TCP Port 1080: Open
+─────────────────────────────────────────
 
 [TLS Detection (Port 443)]
  🟢 TLS 1.2: Supported (Cipher: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
  🟢 TLS 1.3: Supported (Cipher: TLS_AES_128_GCM_SHA256)
+
+[Application Layer (L7) (Port 443)]
+ 🟢 HTTP (over TCP): Negotiated: h2 (Status: 200)
+─────────────────────────────────────────
 
 [Proxy Protocol Detection (TCP Port 443)]
  🟡 Trojan over TLS 65%

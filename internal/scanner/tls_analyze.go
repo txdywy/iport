@@ -150,3 +150,16 @@ func readWithTimeout(conn net.Conn, timeout time.Duration) ([]byte, error) {
 	}
 	return nil, err
 }
+
+// URLHost returns a host string safe for use in URLs.
+// IPv6 addresses are wrapped in brackets; for standard ports (80/443) the port is omitted.
+func URLHost(host, port string) string {
+	// Bracket IPv6
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port == "80" || port == "443" {
+		return host
+	}
+	return host + ":" + port
+}

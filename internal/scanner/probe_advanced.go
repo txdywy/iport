@@ -3,7 +3,6 @@ package scanner
 import (
 	"crypto/rand"
 	"crypto/tls"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -243,7 +242,7 @@ func probeNaiveProxy(host, port string, timeout time.Duration) []ProbeResult {
 	t := &http2.Transport{TLSClientConfig: tlsConf}
 	defer t.CloseIdleConnections()
 
-	url := fmt.Sprintf("https://%s:%s", host, port)
+	url := "https://" + URLHost(host, port)
 	req, _ := http.NewRequest("CONNECT", url, nil)
 	req.Host = "example.com:443"
 

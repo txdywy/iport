@@ -234,10 +234,7 @@ func CheckHTTP(host, port string, timeout time.Duration) (string, error) {
 	if port == "80" {
 		scheme = "http"
 	}
-	urlHost := host
-	if port != "80" && port != "443" {
-		urlHost = net.JoinHostPort(host, port)
-	}
+	urlHost := URLHost(host, port)
 
 	proto, err := doHTTPGet(scheme, urlHost, timeout)
 	if err != nil && port != "80" && port != "443" {
