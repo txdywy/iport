@@ -18,7 +18,7 @@ func main() {
 	var timeoutMs int
 
 	flag.StringVar(&target, "t", "", "Target IP or domain (e.g., example.com, 192.168.1.1)")
-	flag.StringVar(&ports, "p", "80,443", "Ports to scan (comma separated)")
+	flag.StringVar(&ports, "p", "", "Ports to scan (comma separated). If not provided, defaults to 80,443")
 	flag.IntVar(&timeoutMs, "timeout", 2000, "Timeout in milliseconds for each probe")
 	flag.Parse()
 
@@ -34,6 +34,10 @@ func main() {
 		fmt.Println("Usage: iport <target> [options]")
 		flag.PrintDefaults()
 		os.Exit(1)
+	}
+
+	if ports == "" {
+		ports = "80,443"
 	}
 
 	portList := strings.Split(ports, ",")
@@ -108,7 +112,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err, proto := scanner.CheckHTTP(target, timeout)
+			err, proto := scanner.CheckHTTP(target, "443", timeout)
 			if err == nil {
 				ui.PrintResult("HTTP (over TCP)", nil, fmt.Sprintf("Negotiated: %s", proto))
 			} else {

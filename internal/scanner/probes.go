@@ -132,7 +132,7 @@ func CheckTLS(host string, port string, version uint16, timeout time.Duration) (
 }
 
 // CheckHTTP checks standard HTTP/HTTPS and ALPN negotiation
-func CheckHTTP(host string, timeout time.Duration) (error, string) {
+func CheckHTTP(host string, port string, timeout time.Duration) (error, string) {
 	client := &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
@@ -140,10 +140,18 @@ func CheckHTTP(host string, timeout time.Duration) (error, string) {
 		},
 	}
 
-	resp, err := client.Get("https://" + host)
+	target := net.JoinHostPort(host, port)
+
+	// If it's a standard web port, we might not need the port in the URL
+	urlHost := host
+	if port != "80" && port != "443" {
+		urlHost = target
+	}
+
+	resp, err := client.Get("https://" + urlHost)
 	if err != nil {
 		// Fallback to HTTP if HTTPS fails
-		resp, err = client.Get("http://" + host)
+		resp, err = client.Get("http://" + urlHost)
 		if err != nil {
 			return err, ""
 		}
