@@ -11,8 +11,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"golang.org/x/net/http2"
 )
 
 func init() {
@@ -25,7 +23,7 @@ func init() {
 }
 
 // Common V2Ray WebSocket paths to probe
-var wsPaths = []string{"/", "/ws", "/ray", "/vmess", "/vless", "/trojan"}
+var wsPaths = []string{"/", "/ws", "/ray"}
 
 // probeWebSocket detects WebSocket transport (used by V2Ray/Xray for VLESS/VMess/Trojan).
 func probeWebSocket(host, port string, timeout time.Duration) []ProbeResult {
@@ -203,45 +201,27 @@ func extractWSPayload(frame []byte) []byte {
 
 // probeGRPC detects gRPC transport (used by V2Ray/Xray).
 func probeGRPC(host, port string, timeout time.Duration) []ProbeResult {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         host,
-		NextProtos:         []string{"h2"},
-	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", net.JoinHostPort(host, port), tlsConf)
-	if err != nil {
-		return nil
-	}
-	defer conn.Close()
-
-	if conn.ConnectionState().NegotiatedProtocol != "h2" {
-		return nil
-	}
-
-	// Use HTTP/2 client to send gRPC-style request
-	t := &http2.Transport{
-		TLSClientConfig: tlsConf,
+	t := &http.Transport{
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, ServerName: host},
+		ForceAttemptHTTP2: true,
 	}
 	defer t.CloseIdleConnections()
+	client := &http.Client{Transport: t, Timeout: timeout}
 
-	// Try common gRPC service paths
 	for _, svc := range []string{"/grpc", "/GunService/Tun", "/vless", "/vmess"} {
 		url := fmt.Sprintf("https://%s:%s%s", host, port, svc)
 		req, _ := http.NewRequest("POST", url, nil)
 		req.Header.Set("Content-Type", "application/grpc")
 		req.Header.Set("TE", "trailers")
 
-		client := &http.Client{Transport: t, Timeout: timeout}
 		resp, err := client.Do(req)
 		if err != nil {
 			continue
 		}
 		resp.Body.Close()
 
-		// gRPC services return specific headers
 		if resp.Header.Get("Content-Type") == "application/grpc" ||
-			resp.Header.Get("Grpc-Status") != "" ||
-			resp.StatusCode == 200 {
+			resp.Header.Get("Grpc-Status") != "" {
 			proto := "Proxy"
 			if strings.Contains(svc, "vless") {
 				proto = "VLESS"
@@ -284,13 +264,10 @@ func probeHTTPUpgrade(host, port string, timeout time.Duration) []ProbeResult {
 // probeXHTTP detects Xray XHTTP transport.
 // XHTTP uses HTTP POST for upload and GET with streaming for download.
 func probeXHTTP(host, port string, timeout time.Duration) []ProbeResult {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         host,
-		NextProtos:         []string{"h2", "http/1.1"},
+	t := &http.Transport{
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, ServerName: host},
+		ForceAttemptHTTP2: true,
 	}
-
-	t := &http2.Transport{TLSClientConfig: tlsConf}
 	defer t.CloseIdleConnections()
 	client := &http.Client{Transport: t, Timeout: timeout}
 

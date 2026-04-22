@@ -237,8 +237,16 @@ func main() {
 		progressWG.Wait()
 	}
 
-	sort.Strings(openTCPPorts)
-	sort.Strings(openUDPPorts)
+	sort.Slice(openTCPPorts, func(i, j int) bool {
+		a, _ := strconv.Atoi(openTCPPorts[i])
+		b, _ := strconv.Atoi(openTCPPorts[j])
+		return a < b
+	})
+	sort.Slice(openUDPPorts, func(i, j int) bool {
+		a, _ := strconv.Atoi(openUDPPorts[i])
+		b, _ := strconv.Atoi(openUDPPorts[j])
+		return a < b
+	})
 
 	// ========== Phase 2 & 3: TLS + Application Layer ==========
 	if !probeOnly {

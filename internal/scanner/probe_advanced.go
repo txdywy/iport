@@ -257,7 +257,7 @@ func probeNaiveProxy(host, port string, timeout time.Duration) []ProbeResult {
 		return nil
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 
 	switch resp.StatusCode {
 	case 407:

@@ -28,53 +28,54 @@ func probeTrojan(host, port string, timeout time.Duration) []ProbeResult {
 		shortTimeout = 500 * time.Millisecond
 	}
 
-	// Probe 1: Send Trojan-style auth (fake SHA224 hash)
-	conn1, err := dialTLSRaw(host, port, timeout)
-	if err != nil {
-		return nil
+	// Run both probes concurrently
+	type probeOut struct {
+		resp    []byte
+		hasHTTP bool
 	}
-	defer conn1.Close()
+	ch1 := make(chan probeOut, 1)
+	ch2 := make(chan probeOut, 1)
 
-	// Trojan expects: hex(SHA224(password)) + \r\n + cmd(1) + atype(1) + addr + port + \r\n
-	fakeHash := sha256.Sum224([]byte("iport-probe-fake-password"))
-	trojanReq := fmt.Sprintf("%s\r\n\x01\x03\x0bexample.com\x00\x50\r\n", hex.EncodeToString(fakeHash[:]))
-	conn1.SetWriteDeadline(time.Now().Add(shortTimeout))
-	conn1.Write([]byte(trojanReq))
-
-	resp1, _ := readWithTimeout(conn1, shortTimeout)
-
-	// Probe 2: Send plain HTTP GET for comparison
-	conn2, err2 := dialTLSRaw(host, port, timeout)
-	if err2 != nil {
-		// Can't do comparison — only report if we got positive HTTP fallback evidence
-		if len(resp1) > 0 && strings.Contains(string(resp1), "HTTP/") {
-			return []ProbeResult{{Protocol: "Trojan", Transport: "TLS", Confidence: 65}}
+	// Probe 1: Trojan-style auth
+	go func() {
+		conn, err := dialTLSRaw(host, port, timeout)
+		if err != nil {
+			ch1 <- probeOut{}
+			return
 		}
-		return nil // No corroborating evidence — don't report
-	}
-	defer conn2.Close()
+		defer conn.Close()
+		fakeHash := sha256.Sum224([]byte("iport-probe-fake-password"))
+		trojanReq := fmt.Sprintf("%s\r\n\x01\x03\x0bexample.com\x00\x50\r\n", hex.EncodeToString(fakeHash[:]))
+		conn.SetWriteDeadline(time.Now().Add(shortTimeout))
+		conn.Write([]byte(trojanReq))
+		resp, _ := readWithTimeout(conn, shortTimeout)
+		ch1 <- probeOut{resp: resp, hasHTTP: len(resp) > 0 && strings.Contains(string(resp), "HTTP/")}
+	}()
 
-	conn2.SetWriteDeadline(time.Now().Add(shortTimeout))
-	conn2.Write([]byte("GET / HTTP/1.1\r\nHost: " + host + "\r\n\r\n"))
-	resp2, _ := readWithTimeout(conn2, shortTimeout)
+	// Probe 2: Plain HTTP GET
+	go func() {
+		conn, err := dialTLSRaw(host, port, timeout)
+		if err != nil {
+			ch2 <- probeOut{}
+			return
+		}
+		defer conn.Close()
+		conn.SetWriteDeadline(time.Now().Add(shortTimeout))
+		conn.Write([]byte("GET / HTTP/1.1\r\nHost: " + host + "\r\n\r\n"))
+		resp, _ := readWithTimeout(conn, shortTimeout)
+		ch2 <- probeOut{resp: resp, hasHTTP: len(resp) > 0 && strings.Contains(string(resp), "HTTP/")}
+	}()
 
-	// Analysis: Trojan with fallback returns HTTP for both, but with different timing/content
-	// Trojan without fallback: closes on invalid auth, but serves HTTP on plain request
-	hasHTTP1 := len(resp1) > 0 && strings.Contains(string(resp1), "HTTP/")
-	hasHTTP2 := len(resp2) > 0 && strings.Contains(string(resp2), "HTTP/")
+	r1, r2 := <-ch1, <-ch2
 
-	if hasHTTP1 && hasHTTP2 {
-		// Both return HTTP — Trojan with fallback web server
-		// Trojan's fallback response may differ from direct HTTP (different server header, timing)
+	if r1.hasHTTP && r2.hasHTTP {
 		return []ProbeResult{{Protocol: "Trojan", Transport: "TLS", Confidence: 65}}
 	}
-	if !hasHTTP1 && hasHTTP2 {
-		// Trojan-style payload caused close/error, but HTTP works — strong Trojan signal
+	if !r1.hasHTTP && r2.hasHTTP {
 		return []ProbeResult{{Protocol: "Trojan", Transport: "TLS", Confidence: 75}}
 	}
-	if !hasHTTP1 && !hasHTTP2 {
-		// Neither works — no corroborating evidence, don't report
-		return nil
+	if r1.hasHTTP && !r2.hasHTTP {
+		return []ProbeResult{{Protocol: "Trojan", Transport: "TLS", Confidence: 65}}
 	}
 	return nil
 }

@@ -58,8 +58,15 @@ func probeHTTPProxy(host, port string, timeout time.Duration) []ProbeResult {
 		return nil
 	}
 	if strings.HasPrefix(line, "HTTP/") {
-		// 200 = open proxy, 407 = auth required, both confirm it's an HTTP proxy
-		return []ProbeResult{{Protocol: "HTTP Proxy", Transport: "TCP", Confidence: 95}}
+		// Check status code: 200=open proxy, 407=auth required → confirm proxy
+		// 400/405/501 = normal HTTP server rejecting CONNECT → NOT a proxy
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			code := parts[1]
+			if code == "200" || code == "407" {
+				return []ProbeResult{{Protocol: "HTTP Proxy", Transport: "TCP", Confidence: 95}}
+			}
+		}
 	}
 	return nil
 }

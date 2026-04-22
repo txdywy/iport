@@ -45,18 +45,13 @@ func probeSnell(host, port string, timeout time.Duration) []ProbeResult {
 		return nil
 	}
 
-	start := time.Now()
 	conn.SetReadDeadline(time.Now().Add(shortTimeout))
 	resp := make([]byte, 256)
 	n, err := conn.Read(resp)
-	elapsed := time.Since(start)
 
 	if n == 0 && err != nil {
-		// Silent close — consistent with Snell auth failure
-		if elapsed < shortTimeout/2 {
-			return []ProbeResult{{Protocol: "Snell", Transport: "TCP", Confidence: 55}}
-		}
-		return []ProbeResult{{Protocol: "Snell", Transport: "TCP", Confidence: 40}}
+		// Silent close — too ambiguous without corroborating evidence
+		return nil
 	}
 
 	// Snell v1 may respond with version byte
@@ -179,8 +174,8 @@ func probeBrookTCP(host, port string, timeout time.Duration) []ProbeResult {
 	n, err := conn.Read(resp)
 
 	if n == 0 && err != nil {
-		// Silent close on invalid auth — weak Brook signal
-		return []ProbeResult{{Protocol: "Brook", Transport: "TCP", Confidence: 35}}
+		// Silent close — too ambiguous without corroborating evidence
+		return nil
 	}
 	if n > 0 && ShannonEntropy(resp[:n]) > 7.5 {
 		return []ProbeResult{{Protocol: "Brook", Transport: "TCP", Confidence: 45}}

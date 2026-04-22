@@ -17,6 +17,7 @@ type TLSInfo struct {
 	ALPN              string
 	CertCN            string
 	CertSANs          []string
+	CertIPs           []net.IP
 	JA3SHash          string
 	HandshakeDuration time.Duration
 	Conn              *tls.Conn // live connection for further probing
@@ -53,6 +54,7 @@ func AnalyzeTLS(host, port string, timeout time.Duration) (*TLSInfo, error) {
 		cert := state.PeerCertificates[0]
 		info.CertCN = cert.Subject.CommonName
 		info.CertSANs = cert.DNSNames
+		info.CertIPs = cert.IPAddresses
 	}
 
 	info.JA3SHash = computeJA3S(state)
@@ -71,6 +73,16 @@ func computeJA3S(state tls.ConnectionState) string {
 // CertMatchesHost checks if the TLS certificate matches the target host.
 // Returns false if cert CN/SANs don't match — a signal for Reality/domain-fronting.
 func CertMatchesHost(info *TLSInfo, host string) bool {
+	// If target is an IP, check cert IP SANs
+	if ip := net.ParseIP(host); ip != nil {
+		for _, certIP := range info.CertIPs {
+			if certIP.Equal(ip) {
+				return true
+			}
+		}
+		return false
+	}
+
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	if matchesDomain(info.CertCN, host) {
 		return true
