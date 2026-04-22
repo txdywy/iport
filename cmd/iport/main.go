@@ -19,13 +19,13 @@ var Version = "dev"
 
 // ScanResult is the decoupled result type — scanner produces, UI consumes.
 type ScanResult struct {
-	Kind       string // "section", "result", "proxy", "proxy-summary", "progress", "clear-progress"
-	Name       string
-	Err        error
-	Extra      string
-	Port       string
-	Probes     []ui.ProbeDisplay
-	AllProbes  map[string][]ui.ProbeDisplay
+	Kind        string // "section", "result", "proxy", "proxy-summary", "progress", "clear-progress"
+	Name        string
+	Err         error
+	Extra       string
+	Port        string
+	Probes      []ui.ProbeDisplay
+	AllProbes   map[string][]ui.ProbeDisplay
 	Total, Done int
 }
 
@@ -154,10 +154,13 @@ func main() {
 	jobs := make(chan portJob, concurrency)
 	var scannedPorts int32
 	var doneCh chan struct{}
+	var progressWG sync.WaitGroup
 
 	if bigScan {
 		doneCh = make(chan struct{})
+		progressWG.Add(1)
 		go func() {
+			defer progressWG.Done()
 			total := len(portList)
 			ticker := time.NewTicker(200 * time.Millisecond)
 			defer ticker.Stop()
@@ -224,6 +227,7 @@ func main() {
 	wg.Wait()
 	if doneCh != nil {
 		close(doneCh)
+		progressWG.Wait()
 	}
 
 	sort.Strings(openTCPPorts)
