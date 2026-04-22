@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -69,6 +70,67 @@ func ClearProgress() {
 	mu.Lock()
 	defer mu.Unlock()
 	fmt.Printf("\r\033[K")
+}
+
+// PrintPortList prints a compact list of ports, merging consecutive runs.
+func PrintPortList(title string, ports []string, note string) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(ports) == 0 {
+		fmt.Printf(" %s %s: none\n", dimColor("⚪"), title)
+		return
+	}
+
+	ranges := compactPortRanges(ports)
+	fmt.Printf(" %s %s: %s\n", warnColor("🟡"), title, warnColor(fmt.Sprintf("%d ports", len(ports))))
+	if note != "" {
+		fmt.Printf("   %s\n", dimColor(note))
+	}
+	for i := 0; i < len(ranges); i += 8 {
+		end := i + 8
+		if end > len(ranges) {
+			end = len(ranges)
+		}
+		fmt.Printf("   %s\n", strings.Join(ranges[i:end], ", "))
+	}
+}
+
+func compactPortRanges(ports []string) []string {
+	nums := make([]int, 0, len(ports))
+	seen := make(map[int]bool, len(ports))
+	for _, s := range ports {
+		p, err := strconv.Atoi(s)
+		if err != nil || seen[p] {
+			continue
+		}
+		seen[p] = true
+		nums = append(nums, p)
+	}
+	sort.Ints(nums)
+	if len(nums) == 0 {
+		return nil
+	}
+
+	var ranges []string
+	start, prev := nums[0], nums[0]
+	flush := func() {
+		if start == prev {
+			ranges = append(ranges, strconv.Itoa(start))
+		} else {
+			ranges = append(ranges, fmt.Sprintf("%d-%d", start, prev))
+		}
+	}
+	for _, p := range nums[1:] {
+		if p == prev+1 {
+			prev = p
+			continue
+		}
+		flush()
+		start, prev = p, p
+	}
+	flush()
+	return ranges
 }
 
 // ProbeDisplay is a simplified view of a probe result for the UI layer.

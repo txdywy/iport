@@ -24,6 +24,7 @@ type ScanResult struct {
 	Err         error
 	Extra       string
 	Port        string
+	Ports       []string
 	Probes      []ui.ProbeDisplay
 	AllProbes   map[string][]ui.ProbeDisplay
 	Total, Done int
@@ -148,6 +149,8 @@ func main() {
 				ui.PrintProxyResults(r.Port, r.Probes)
 			case "proxy-summary":
 				ui.PrintProxySummary(r.AllProbes)
+			case "ports":
+				ui.PrintPortList(r.Name, r.Ports, r.Extra)
 			case "progress":
 				ui.PrintProgress(r.Total, r.Done)
 			case "clear-progress":
@@ -184,7 +187,7 @@ func main() {
 	}()
 
 	// TCP/UDP port scanning
-	var openTCPPorts, openUDPPorts []string
+	var openTCPPorts, openUDPPorts, openUDPFilteredPorts []string
 	var portsMu sync.Mutex
 
 	type portJob struct{ port string }
@@ -236,11 +239,14 @@ func main() {
 				if scanUDP {
 					udpErr := scanner.CheckUDP(target, port, timeout)
 					if udpErr != nil && strings.Contains(udpErr.Error(), "timeout") {
-						// open|filtered — candidate for UDP proxy probes
+						// open|filtered — possible UDP service; summarize in big scans.
 						portsMu.Lock()
-						openUDPPorts = append(openUDPPorts, port)
+						openUDPFilteredPorts = append(openUDPFilteredPorts, port)
 						portsMu.Unlock()
 						if !bigScan {
+							portsMu.Lock()
+							openUDPPorts = append(openUDPPorts, port)
+							portsMu.Unlock()
 							emit(ScanResult{Kind: "result", Name: fmt.Sprintf("UDP Port %s", port), Err: fmt.Errorf("timeout (open|filtered)")})
 						}
 					} else if udpErr == nil {
@@ -280,6 +286,18 @@ func main() {
 		b, _ := strconv.Atoi(openUDPPorts[j])
 		return a < b
 	})
+	sort.Slice(openUDPFilteredPorts, func(i, j int) bool {
+		a, _ := strconv.Atoi(openUDPFilteredPorts[i])
+		b, _ := strconv.Atoi(openUDPFilteredPorts[j])
+		return a < b
+	})
+
+	if bigScan && scanUDP && len(openUDPFilteredPorts) > 0 {
+		emitBatch([]ScanResult{
+			{Kind: "section", Name: "UDP Open|Filtered Candidates"},
+			{Kind: "ports", Name: "UDP open|filtered", Ports: openUDPFilteredPorts, Extra: "Possible open UDP ports; no response was received before timeout."},
+		})
+	}
 
 	// ========== Phase 2 & 3: TLS + Application Layer ==========
 	if !probeOnly {
