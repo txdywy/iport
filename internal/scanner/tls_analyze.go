@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
@@ -11,6 +12,54 @@ import (
 
 	"github.com/txdywy/iport/internal/netutil"
 )
+
+// pinnedIP is set by PinTarget to ensure all probes hit the same server.
+var pinnedIP string
+
+// PinTarget resolves a hostname once and pins the IP for all subsequent dial operations.
+func PinTarget(host string) (string, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		pinnedIP = ip.String()
+		return pinnedIP, nil
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return "", err
+	}
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			pinnedIP = ip.String()
+			return pinnedIP, nil
+		}
+	}
+	if len(ips) > 0 {
+		pinnedIP = ips[0].String()
+		return pinnedIP, nil
+	}
+	return "", fmt.Errorf("no IP found for %s", host)
+}
+
+// dialTarget returns host:port using the pinned IP if available.
+func dialTarget(host, port string) string {
+	if pinnedIP != "" {
+		return net.JoinHostPort(pinnedIP, port)
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// dialTCP connects using the pinned IP if available.
+func dialTCP(host, port string, timeout time.Duration) (net.Conn, error) {
+	return net.DialTimeout("tcp", dialTarget(host, port), timeout)
+}
+
+// pinnedDialContext is a net.Dialer.DialContext replacement that uses the pinned IP.
+func pinnedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if pinnedIP != "" {
+		_, port, _ := net.SplitHostPort(addr)
+		addr = net.JoinHostPort(pinnedIP, port)
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, addr)
+}
 
 // TLSInfo holds metadata extracted from a TLS handshake for protocol fingerprinting.
 type TLSInfo struct {
@@ -37,7 +86,7 @@ func AnalyzeTLS(host, port string, timeout time.Duration) (*TLSInfo, error) {
 	}
 
 	start := time.Now()
-	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(host, port), conf)
+	conn, err := tls.DialWithDialer(dialer, "tcp", dialTarget(host, port), conf)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +184,7 @@ func ShannonEntropy(data []byte) float64 {
 // This is a lighter version of AnalyzeTLS when we don't need full metadata.
 func dialTLSRaw(host, port string, timeout time.Duration) (*tls.Conn, error) {
 	dialer := &net.Dialer{Timeout: timeout}
-	return tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(host, port), &tls.Config{
+	return tls.DialWithDialer(dialer, "tcp", dialTarget(host, port), &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         host,
 	})

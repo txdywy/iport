@@ -21,7 +21,7 @@ func init() {
 }
 
 func probeWireGuard(host, port string, timeout time.Duration) []ProbeResult {
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, port))
+	addr, err := net.ResolveUDPAddr("udp", dialTarget(host, port))
 	if err != nil {
 		return nil
 	}
@@ -64,7 +64,7 @@ func probeHysteria2(host, port string, timeout time.Duration) []ProbeResult {
 	defer cancel()
 
 	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
-	conn, err := quic.DialAddr(ctx, net.JoinHostPort(host, port), tlsConf, &quic.Config{MaxIdleTimeout: timeout})
+	conn, err := quic.DialAddr(ctx, dialTarget(host, port), tlsConf, &quic.Config{MaxIdleTimeout: timeout})
 	if err != nil {
 		return nil
 	}
@@ -109,7 +109,7 @@ func probeTUIC(host, port string, timeout time.Duration) []ProbeResult {
 	defer cancel()
 
 	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
-	conn, err := quic.DialAddr(ctx, net.JoinHostPort(host, port), tlsConf, &quic.Config{MaxIdleTimeout: timeout})
+	conn, err := quic.DialAddr(ctx, dialTarget(host, port), tlsConf, &quic.Config{MaxIdleTimeout: timeout})
 	if err != nil {
 		return nil
 	}
@@ -136,7 +136,7 @@ func probeQUIC(host, port string, timeout time.Duration, alpn []string, proto st
 		InsecureSkipVerify: true,
 		NextProtos:         alpn,
 	}
-	conn, err := quic.DialAddr(ctx, net.JoinHostPort(host, port), tlsConf, &quic.Config{
+	conn, err := quic.DialAddr(ctx, dialTarget(host, port), tlsConf, &quic.Config{
 		MaxIdleTimeout: timeout,
 	})
 	if err != nil {
@@ -155,7 +155,7 @@ func probeQUIC(host, port string, timeout time.Duration, alpn []string, proto st
 }
 
 func probeMKCP(host, port string, timeout time.Duration) []ProbeResult {
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, port))
+	addr, err := net.ResolveUDPAddr("udp", dialTarget(host, port))
 	if err != nil {
 		return nil
 	}

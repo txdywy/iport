@@ -23,7 +23,7 @@ func init() {
 // Snell v1/v2: version(1) + command(1) + AEAD encrypted payload
 // Invalid auth → server closes connection silently.
 func probeSnell(host, port string, timeout time.Duration) []ProbeResult {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+	conn, err := dialTCP(host, port, timeout)
 	if err != nil {
 		return nil
 	}
@@ -67,7 +67,7 @@ func probeSnell(host, port string, timeout time.Duration) []ProbeResult {
 // The client sends a padded handshake message with a specific structure.
 // Detection: send random data of obfs4 handshake size, analyze response timing and pattern.
 func probeObfs4(host, port string, timeout time.Duration) []ProbeResult {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+	conn, err := dialTCP(host, port, timeout)
 	if err != nil {
 		return nil
 	}
@@ -129,7 +129,7 @@ func probeBrookWS(host, port string, timeout time.Duration) []ProbeResult {
 	var conn net.Conn
 	tlsConn, err := dialTLSRaw(host, port, timeout)
 	if err != nil {
-		conn, err = net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+		conn, err = dialTCP(host, port, timeout)
 		if err != nil {
 			return nil
 		}
@@ -160,7 +160,7 @@ func probeBrookWS(host, port string, timeout time.Duration) []ProbeResult {
 }
 
 func probeBrookTCP(host, port string, timeout time.Duration) []ProbeResult {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+	conn, err := dialTCP(host, port, timeout)
 	if err != nil {
 		return nil
 	}

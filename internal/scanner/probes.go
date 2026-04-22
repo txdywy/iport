@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -51,6 +52,7 @@ func init() {
 	tr := &http.Transport{
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
 		ForceAttemptHTTP2: true,
+		DialContext:       pinnedDialContext,
 		MaxIdleConns:      100,
 		IdleConnTimeout:   30 * time.Second,
 		DisableKeepAlives: false,
@@ -86,7 +88,7 @@ func CheckTCP(host, port string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	d := net.Dialer{}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+	conn, err := d.DialContext(ctx, "tcp", dialTarget(host, port))
 	if err != nil {
 		return err
 	}
@@ -105,7 +107,7 @@ func CheckUDP(host, port string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	d := net.Dialer{}
-	conn, err := d.DialContext(ctx, "udp", net.JoinHostPort(host, port))
+	conn, err := d.DialContext(ctx, "udp", dialTarget(host, port))
 	if err != nil {
 		return err
 	}
@@ -130,9 +132,15 @@ func CheckUDP(host, port string, timeout time.Duration) error {
 // Ping sends an ICMP Echo Request, supporting both IPv4 and IPv6.
 // Tries unprivileged UDP ping first, then falls back to raw socket.
 func Ping(host string, timeout time.Duration) (time.Duration, error) {
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return 0, err
+	var ips []net.IP
+	if pinnedIP != "" {
+		ips = []net.IP{net.ParseIP(pinnedIP)}
+	} else {
+		var err error
+		ips, err = net.LookupIP(host)
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	// Prefer IPv4, fall back to IPv6
@@ -208,11 +216,13 @@ func doPing(c *icmp.PacketConn, dst net.Addr, isV6 bool, timeout time.Duration) 
 
 	id := os.Getpid() & 0xffff
 	seq := int(time.Now().UnixNano() & 0xffff)
+	pingData := make([]byte, 11)
+	rand.Read(pingData)
 	wm := icmp.Message{
 		Type: msgType, Code: 0,
 		Body: &icmp.Echo{
 			ID: id, Seq: seq,
-			Data: []byte("HELLO-IPORT"),
+			Data: pingData,
 		},
 	}
 	wb, err := wm.Marshal(nil)
@@ -263,7 +273,7 @@ func CheckTLS(host, port string, version uint16, timeout time.Duration) (string,
 			ServerName:         host,
 		},
 	}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+	conn, err := d.DialContext(ctx, "tcp", dialTarget(host, port))
 	if err != nil {
 		return "", err
 	}
@@ -330,7 +340,7 @@ func CheckHTTP3(host, port string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	conn, err := quic.DialAddr(ctx, net.JoinHostPort(host, port), &tls.Config{
+	conn, err := quic.DialAddr(ctx, dialTarget(host, port), &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"h3"},
 	}, &quic.Config{})

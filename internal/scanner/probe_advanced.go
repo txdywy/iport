@@ -280,7 +280,7 @@ func probeNaiveProxy(host, port string, timeout time.Duration) []ProbeResult {
 		ServerName:         host,
 		NextProtos:         []string{"h2"},
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", net.JoinHostPort(host, port), tlsConf)
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", dialTarget(host, port), tlsConf)
 	if err != nil {
 		return nil
 	}

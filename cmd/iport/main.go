@@ -115,6 +115,12 @@ func main() {
 	// Normalize IPv6: strip brackets/zone for dial, keep clean for display
 	target = scanner.NormalizeHost(target)
 
+	// Resolve DNS once and pin the IP for all subsequent operations
+	if _, err := scanner.PinTarget(target); err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", target, err)
+		os.Exit(1)
+	}
+
 	// Validate concurrency
 	if concurrency < 1 {
 		concurrency = 1

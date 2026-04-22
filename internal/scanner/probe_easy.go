@@ -3,7 +3,6 @@ package scanner
 import (
 	"bufio"
 	"fmt"
-	"net"
 	"strings"
 	"time"
 )
@@ -17,7 +16,7 @@ func init() {
 }
 
 func probeSOCKS5(host, port string, timeout time.Duration) []ProbeResult {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+	conn, err := dialTCP(host, port, timeout)
 	if err != nil {
 		return nil
 	}
@@ -41,7 +40,7 @@ func probeSOCKS5(host, port string, timeout time.Duration) []ProbeResult {
 }
 
 func probeHTTPProxy(host, port string, timeout time.Duration) []ProbeResult {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+	conn, err := dialTCP(host, port, timeout)
 	if err != nil {
 		return nil
 	}
@@ -72,7 +71,7 @@ func probeHTTPProxy(host, port string, timeout time.Duration) []ProbeResult {
 }
 
 func probeSSH(host, port string, timeout time.Duration) []ProbeResult {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+	conn, err := dialTCP(host, port, timeout)
 	if err != nil {
 		return nil
 	}

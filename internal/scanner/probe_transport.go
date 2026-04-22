@@ -40,7 +40,7 @@ func tryWSUpgrade(host, port, path string, timeout time.Duration) []ProbeResult 
 	conn, err := dialTLSRaw(host, port, timeout)
 	if err != nil {
 		// Try plain TCP for non-TLS WebSocket
-		tcpConn, err2 := net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+		tcpConn, err2 := dialTCP(host, port, timeout)
 		if err2 != nil {
 			return nil
 		}
@@ -222,6 +222,7 @@ func probeGRPC(host, port string, timeout time.Duration) []ProbeResult {
 	t := &http.Transport{
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, ServerName: host},
 		ForceAttemptHTTP2: true,
+		DialContext:       pinnedDialContext,
 	}
 	defer t.CloseIdleConnections()
 	client := &http.Client{Transport: t, Timeout: timeout}
@@ -263,7 +264,7 @@ func probeHTTPUpgrade(host, port string, timeout time.Duration) []ProbeResult {
 		var conn net.Conn
 		tlsConn, err := dialTLSRaw(host, port, timeout)
 		if err != nil {
-			conn, err = net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+			conn, err = dialTCP(host, port, timeout)
 			if err != nil {
 				continue
 			}
@@ -302,6 +303,7 @@ func probeXHTTP(host, port string, timeout time.Duration) []ProbeResult {
 	t := &http.Transport{
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, ServerName: host},
 		ForceAttemptHTTP2: true,
+		DialContext:       pinnedDialContext,
 	}
 	defer t.CloseIdleConnections()
 	client := &http.Client{Transport: t, Timeout: timeout}

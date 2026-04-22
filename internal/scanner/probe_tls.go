@@ -2,7 +2,6 @@ package scanner
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -70,7 +69,8 @@ func probeTrojan(host, port string, timeout time.Duration) []ProbeResult {
 		ch1 <- doTLSProbe(p)
 	}()
 	go func() {
-		fakeHash := sha256.Sum224([]byte("iport-probe"))
+		var fakeHash [28]byte
+		rand.Read(fakeHash[:])
 		trojanReq := fmt.Sprintf("%s\r\n\x01\x03\x0bexample.com\x00\x50\r\n", hex.EncodeToString(fakeHash[:]))
 		ch2 <- doTLSProbe([]byte(trojanReq))
 	}()

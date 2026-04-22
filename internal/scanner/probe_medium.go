@@ -2,7 +2,6 @@ package scanner
 
 import (
 	"crypto/rand"
-	"net"
 	"strings"
 	"time"
 )
@@ -41,7 +40,7 @@ func probeShadowsocks(host, port string, timeout time.Duration) []ProbeResult {
 	}
 
 	doProbe := func(payload []byte) probeResult {
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+		conn, err := dialTCP(host, port, timeout)
 		if err != nil {
 			return probeResult{gotClose: true}
 		}
@@ -170,7 +169,7 @@ func probeShadowsocks(host, port string, timeout time.Duration) []ProbeResult {
 // VMess auth: 16-byte hash of (timestamp XOR UUID), then encrypted request header.
 // Invalid auth → server typically closes connection after reading 16 bytes.
 func probeVMess(host, port string, timeout time.Duration) []ProbeResult {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+	conn, err := dialTCP(host, port, timeout)
 	if err != nil {
 		return nil
 	}
