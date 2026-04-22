@@ -25,10 +25,19 @@ func PrintHeader(target string) {
 	fmt.Printf("\n🎯 %s: %s\n\n", bold("Target"), infoColor(target))
 }
 
+var sectionSep = color.New(color.FgHiBlack).SprintFunc()
+
+// track whether we've printed at least one section (skip separator for the first)
+var firstSection = true
+
 func PrintSection(title string) {
 	mu.Lock()
 	defer mu.Unlock()
-	fmt.Printf("%s\n", bold("["+title+"]"))
+	if !firstSection {
+		fmt.Printf("%s\n", sectionSep("─────────────────────────────────────────"))
+	}
+	firstSection = false
+	fmt.Printf("\n%s\n", bold("["+title+"]"))
 }
 
 func PrintResult(name string, err error, extra string) {

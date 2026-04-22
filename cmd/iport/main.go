@@ -43,6 +43,7 @@ func main() {
 		timeoutMs   int
 		showVersion bool
 		allPorts    bool
+		tcpOnly     bool
 		concurrency int
 		probeProxy  bool
 		probeOnly   bool
@@ -53,7 +54,8 @@ func main() {
 	flag.StringVar(&ports, "p", "", "Ports to scan (comma separated, default: 80,443)")
 	flag.IntVar(&timeoutMs, "timeout", 2000, "Timeout in milliseconds")
 	flag.BoolVar(&showVersion, "V", false, "Show version and exit")
-	flag.BoolVar(&allPorts, "A", false, "Scan all 65535 TCP ports")
+	flag.BoolVar(&allPorts, "A", false, "Scan all 65535 TCP+UDP ports")
+	flag.BoolVar(&tcpOnly, "T", false, "TCP only, skip UDP scanning")
 	flag.IntVar(&concurrency, "c", 1000, "Maximum concurrent scans")
 	flag.BoolVar(&probeProxy, "probe", true, "Enable proxy protocol detection")
 	flag.BoolVar(&probeOnly, "probe-only", false, "Skip TLS/HTTP, only run proxy probes")
@@ -102,6 +104,7 @@ func main() {
 		}
 	}
 
+	scanUDP := !tcpOnly
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	bigScan := len(portList) > 100
 
@@ -194,7 +197,7 @@ func main() {
 					emit(ScanResult{Kind: "result", Name: fmt.Sprintf("TCP Port %s", port), Err: err})
 				}
 
-				if !allPorts {
+				if scanUDP {
 					udpErr := scanner.CheckUDP(target, port, timeout)
 					if udpErr != nil && strings.Contains(udpErr.Error(), "timeout") {
 						portsMu.Lock()
