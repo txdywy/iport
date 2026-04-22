@@ -10,6 +10,7 @@ A fast, zero-configuration, dependency-free network probe and diagnostic tool.
 - **TLS Version Scanning:** Automatically checks support for TLS 1.0, 1.1, 1.2, and 1.3, including cipher suites.
 - **Advanced HTTP Protocols:** Negotiates HTTP/1.1 and HTTP/2 over ALPN, and checks for HTTP/3 (QUIC) support over UDP.
 - **Proxy Protocol Detection:** Actively probes open ports to identify 25 proxy/tunnel protocols with confidence scoring and transport layer identification.
+- **Website Connectivity Diagnosis:** `-G` checks DNS, TCP, TLS/SNI, HTTP, and QUIC to identify likely access failures and GFW-style blocking signals.
 - **Zero Configuration:** Sane defaults give you a comprehensive report immediately.
 - **Static Binary:** Built with Go, meaning it's a single binary with no external dependencies (no need for `nmap`, `openssl`, etc.).
 
@@ -43,6 +44,9 @@ iport example.com
 
 # Specify custom ports
 iport 192.168.1.100 -p 80,443,8080,8443
+
+# Diagnose website accessibility and likely blocking root cause
+iport -G https://example.com
 
 # TCP only
 iport example.com -T
@@ -83,6 +87,7 @@ iport example.com -A -c 2000
 | `-probe` | `true` | Enable proxy protocol detection |
 | `-probe-only` | `false` | Skip TLS/HTTP, only run proxy probes |
 | `-list-probes` | `false` | List all 25 supported protocol probes and exit |
+| `-G` | | Diagnose website accessibility and likely blocking root cause |
 | `-V` | `false` | Show version and exit |
 
 ## Example Output

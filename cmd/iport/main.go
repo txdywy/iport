@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/txdywy/iport/internal/scanner"
 	"github.com/txdywy/iport/internal/ui"
+	"github.com/txdywy/iport/internal/webcheck"
 )
 
 var Version = "dev"
@@ -60,6 +62,7 @@ func main() {
 		probeProxy  bool
 		probeOnly   bool
 		listProbes  bool
+		website     string
 	)
 
 	flag.StringVar(&target, "t", "", "Target IP or domain")
@@ -73,6 +76,7 @@ func main() {
 	flag.BoolVar(&probeProxy, "probe", true, "Enable proxy protocol detection")
 	flag.BoolVar(&probeOnly, "probe-only", false, "Skip TLS/HTTP, only run proxy probes")
 	flag.BoolVar(&listProbes, "list-probes", false, "List supported protocols and exit")
+	flag.StringVar(&website, "G", "", "Diagnose website accessibility and likely blocking root cause")
 	flag.Parse()
 
 	if showVersion {
@@ -81,6 +85,16 @@ func main() {
 	}
 	if listProbes {
 		ui.PrintProbeList(scanner.ListAllProbes())
+		os.Exit(0)
+	}
+	if website != "" {
+		timeout := time.Duration(timeoutMs) * time.Millisecond
+		diag, err := webcheck.Check(context.Background(), website, webcheck.Options{Timeout: timeout})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		ui.PrintWebDiagnosis(diag)
 		os.Exit(0)
 	}
 
@@ -369,7 +383,7 @@ func main() {
 			var combinedUDPPorts []string
 			combinedUDPPorts = append(combinedUDPPorts, openUDPPorts...)
 			combinedUDPPorts = append(combinedUDPPorts, openUDPFilteredPorts...)
-			
+
 			// Deduplicate UDP ports
 			udpPortMap := make(map[string]bool)
 			var uniqueUDPPorts []string
@@ -379,7 +393,7 @@ func main() {
 					uniqueUDPPorts = append(uniqueUDPPorts, port)
 				}
 			}
-			
+
 			for _, port := range uniqueUDPPorts {
 				wg.Add(1)
 				go func(port string) {
@@ -426,7 +440,7 @@ func main() {
 		if bigScan {
 			proxyUDPPorts = append(proxyUDPPorts, openUDPFilteredPorts...)
 		}
-		
+
 		// Deduplicate UDP ports
 		udpPortMap := make(map[string]bool)
 		var uniqueProxyUDPPorts []string

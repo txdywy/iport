@@ -6,8 +6,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fatih/color"
+	"github.com/txdywy/iport/internal/webcheck"
 )
 
 var (
@@ -227,4 +229,126 @@ func PrintProbeList(names []string) {
 		fmt.Printf("  %2d. %s\n", i+1, name)
 	}
 	fmt.Printf("\n  Total: %d protocols\n\n", len(names))
+}
+
+func PrintWebDiagnosis(d *webcheck.Diagnosis) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	fmt.Printf("\n%s\n", bold("[Website Connectivity Diagnosis]"))
+	fmt.Printf(" %s Target: %s\n", infoColor("•"), infoColor(d.Target.Raw))
+	fmt.Printf(" %s Overall: %s (%d%%)\n", verdictIcon(d.Overall), verdictColor(d.Overall)(string(d.Overall)), d.Confidence)
+	fmt.Printf(" %s Root Cause: %s\n", infoColor("•"), d.RootCause)
+	if d.Summary != "" {
+		fmt.Printf(" %s %s\n", dimColor("•"), d.Summary)
+	}
+	if len(d.Evidence) > 0 {
+		fmt.Printf(" %s Evidence:\n", infoColor("•"))
+		for _, e := range d.Evidence {
+			fmt.Printf("   %s\n", e)
+		}
+	}
+
+	for _, layer := range d.Layers {
+		fmt.Printf("%s\n", sectionSep("─────────────────────────────────────────"))
+		fmt.Printf("\n%s\n", bold("["+layer.Name+"]"))
+		fmt.Printf(" %s Status: %s", statusIcon(layer.Status), statusColor(layer.Status)(layer.Status))
+		if layer.Confidence > 0 {
+			fmt.Printf(" (%d%%)", layer.Confidence)
+		}
+		fmt.Println()
+		if layer.Summary != "" {
+			fmt.Printf("   %s\n", layer.Summary)
+		}
+		printAttempts(layer.Attempts)
+	}
+	fmt.Println()
+}
+
+func printAttempts(attempts []webcheck.Attempt) {
+	const maxAttempts = 18
+	for i, a := range attempts {
+		if i == maxAttempts {
+			fmt.Printf("   %s %d more attempts omitted\n", dimColor("…"), len(attempts)-maxAttempts)
+			return
+		}
+		icon := errorColor("🔴")
+		if a.OK {
+			icon = successColor("🟢")
+		} else if a.Err == "" {
+			icon = dimColor("⚪")
+		} else if strings.Contains(a.Err, "timeout") || strings.Contains(a.Err, "drop") {
+			icon = warnColor("🟡")
+		}
+		detail := a.Detail
+		if detail == "" {
+			detail = a.Err
+		}
+		if detail == "" {
+			detail = "no answer"
+		}
+		fmt.Printf("   %s %-38s %-10s %s\n", icon, fit(a.Target, 38), a.Latency.Truncate(time.Millisecond), dimColor(detail))
+	}
+}
+
+func fit(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	if n <= 1 {
+		return s[:n]
+	}
+	return s[:n-1] + "…"
+}
+
+func verdictIcon(v webcheck.Verdict) string {
+	switch v {
+	case webcheck.VerdictNormal:
+		return successColor("🟢")
+	case webcheck.VerdictLikelyGFW:
+		return warnColor("🟡")
+	case webcheck.VerdictAbnormal:
+		return errorColor("🔴")
+	default:
+		return dimColor("⚪")
+	}
+}
+
+func verdictColor(v webcheck.Verdict) func(a ...interface{}) string {
+	switch v {
+	case webcheck.VerdictNormal:
+		return successColor
+	case webcheck.VerdictLikelyGFW:
+		return warnColor
+	case webcheck.VerdictAbnormal:
+		return errorColor
+	default:
+		return dimColor
+	}
+}
+
+func statusIcon(status string) string {
+	switch status {
+	case "ok":
+		return successColor("🟢")
+	case "anomaly":
+		return warnColor("🟡")
+	case "fail":
+		return errorColor("🔴")
+	default:
+		return dimColor("⚪")
+	}
+}
+
+func statusColor(status string) func(a ...interface{}) string {
+	switch status {
+	case "ok":
+		return successColor
+	case "anomaly":
+		return warnColor
+	case "fail":
+		return errorColor
+	default:
+		return dimColor
+	}
 }
