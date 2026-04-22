@@ -34,6 +34,12 @@ var sectionSep = color.New(color.FgHiBlack).SprintFunc()
 // track whether we've printed at least one section (skip separator for the first)
 var firstSection = true
 
+func Reset() {
+	mu.Lock()
+	defer mu.Unlock()
+	firstSection = true
+}
+
 func PrintSection(title string) {
 	mu.Lock()
 	defer mu.Unlock()

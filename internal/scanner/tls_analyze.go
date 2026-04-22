@@ -152,10 +152,14 @@ func readWithTimeout(conn net.Conn, timeout time.Duration) ([]byte, error) {
 	return nil, err
 }
 
-// URLHost returns a host string safe for use in URLs.
-// IPv6 addresses are wrapped in brackets; for standard ports (80/443) the port is omitted.
+// URLHost returns a host string safe for HTTPS URLs.
+// IPv6 addresses are wrapped in brackets; port 443 is omitted.
 func URLHost(host, port string) string {
-	return netutil.URLHost(host, port)
+	return netutil.URLHostForScheme(host, port, "https")
+}
+
+func URLHostForScheme(host, port, scheme string) string {
+	return netutil.URLHostForScheme(host, port, scheme)
 }
 
 // NormalizeHost strips brackets and zone IDs from a host string for use in dial/SNI.

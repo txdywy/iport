@@ -29,10 +29,30 @@ func HostForHTTP(host string) string {
 	return host
 }
 
-// URLHost returns a host string safe for URLs, omitting standard ports.
+// URLHost returns a host string safe for URLs, omitting common default ports.
 func URLHost(host, port string) string {
+	return URLHostForScheme(host, port, "")
+}
+
+// URLHostForScheme returns a host string safe for URLs, omitting only the
+// default port for the given scheme.
+func URLHostForScheme(host, port, scheme string) string {
 	h := HostForHTTP(host)
-	if port == "80" || port == "443" {
+	switch scheme {
+	case "http":
+		if port == "80" {
+			return h
+		}
+	case "https":
+		if port == "443" {
+			return h
+		}
+	default:
+		if port == "80" || port == "443" {
+			return h
+		}
+	}
+	if port == "" {
 		return h
 	}
 	return h + ":" + port

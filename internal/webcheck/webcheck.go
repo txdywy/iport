@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -29,6 +28,7 @@ import (
 const (
 	attemptsPerCheck = 3
 	maxTestIPs       = 2
+	maxDNSMessageLen = 8192
 )
 
 type Verdict string
@@ -510,11 +510,7 @@ func (r *runner) httpAttempt(ctx context.Context, target Target, ip, hostHeader 
 		return http.ErrUseLastResponse
 	}}
 
-	u := target.Scheme + "://" + netutil.HostForHTTP(target.Host)
-	if (target.Scheme == "http" && target.Port != "80") || (target.Scheme == "https" && target.Port != "443") {
-		u += ":" + target.Port
-	}
-	u += target.Path
+	u := target.Scheme + "://" + netutil.URLHostForScheme(target.Host, target.Port, target.Scheme) + target.Path
 	req, err := http.NewRequestWithContext(cctx, "GET", u, nil)
 	if err != nil {
 		return Attempt{Target: u, Latency: time.Since(start), Err: err.Error()}
@@ -626,7 +622,11 @@ func (r *runner) randomUDPProbe(ctx context.Context, ip string) Attempt {
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(r.timeout))
-	conn.Write([]byte("IPORT-G-UDP-CONTROL"))
+	if _, err := conn.Write([]byte("IPORT-G-UDP-CONTROL")); err != nil {
+		at.Latency = time.Since(start)
+		at.Err = classifyNetErr(err)
+		return at
+	}
 	buf := make([]byte, 64)
 	_, err = conn.Read(buf)
 	at.Latency = time.Since(start)
@@ -636,7 +636,6 @@ func (r *runner) randomUDPProbe(ctx context.Context, ip string) Attempt {
 		at.OK = true
 		at.Detail = "received UDP response"
 	}
-	_ = ctx
 	return at
 }
 
@@ -730,7 +729,13 @@ func queryDNS(ctx context.Context, network, resolver, host string, qtype dnsmess
 			at.Err = classifyNetErr(err)
 			return nil, at
 		}
-		resp := make([]byte, binary.BigEndian.Uint16(prefix[:]))
+		size := int(binary.BigEndian.Uint16(prefix[:]))
+		if size == 0 || size > maxDNSMessageLen {
+			at.Latency = time.Since(start)
+			at.Err = fmt.Sprintf("invalid DNS TCP response length: %d", size)
+			return nil, at
+		}
+		resp := make([]byte, size)
 		_, err = io.ReadFull(conn, resp)
 		msg = resp
 	} else {
@@ -960,12 +965,4 @@ func classifyNetErr(err error) string {
 	default:
 		return err.Error()
 	}
-}
-
-func DoHGetURL(endpoint, host string, qtype dnsmessage.Type) (string, error) {
-	msg, err := dnsQueryMessage(host, qtype)
-	if err != nil {
-		return "", err
-	}
-	return endpoint + "?dns=" + base64.RawURLEncoding.EncodeToString(msg), nil
 }

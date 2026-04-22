@@ -50,10 +50,10 @@ var sharedHTTPClient *http.Client
 func init() {
 	tr := &http.Transport{
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
-		ForceAttemptHTTP2:  true,
-		MaxIdleConns:       100,
-		IdleConnTimeout:    30 * time.Second,
-		DisableKeepAlives:  false,
+		ForceAttemptHTTP2: true,
+		MaxIdleConns:      100,
+		IdleConnTimeout:   30 * time.Second,
+		DisableKeepAlives: false,
 	}
 	sharedHTTPClient = &http.Client{
 		Transport: tr,
@@ -80,6 +80,9 @@ func TLSVersionName(v uint16) string {
 
 // CheckTCP attempts to connect to a TCP port using context for timeout control.
 func CheckTCP(host, port string, timeout time.Duration) error {
+	acquire()
+	defer release()
+
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	d := net.Dialer{}
@@ -96,6 +99,9 @@ var ErrUDPOpenFiltered = errors.New("timeout (open|filtered)")
 
 // CheckUDP sends a packet to a UDP port and waits for an ICMP unreachable.
 func CheckUDP(host, port string, timeout time.Duration) error {
+	acquire()
+	defer release()
+
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	d := net.Dialer{}
@@ -200,10 +206,12 @@ func doPing(c *icmp.PacketConn, dst net.Addr, isV6 bool, timeout time.Duration) 
 		proto = 1 // ICMPv4
 	}
 
+	id := os.Getpid() & 0xffff
+	seq := int(time.Now().UnixNano() & 0xffff)
 	wm := icmp.Message{
 		Type: msgType, Code: 0,
 		Body: &icmp.Echo{
-			ID: os.Getpid() & 0xffff, Seq: 1,
+			ID: id, Seq: seq,
 			Data: []byte("HELLO-IPORT"),
 		},
 	}
@@ -230,6 +238,10 @@ func doPing(c *icmp.PacketConn, dst net.Addr, isV6 bool, timeout time.Duration) 
 		return 0, err
 	}
 	if rm.Type == replyType {
+		echo, ok := rm.Body.(*icmp.Echo)
+		if !ok || echo.ID != id || echo.Seq != seq {
+			return 0, fmt.Errorf("unexpected ICMP echo reply")
+		}
 		return rtt, nil
 	}
 	return 0, fmt.Errorf("unexpected ICMP type: %v", rm.Type)
@@ -272,7 +284,7 @@ func CheckHTTP(host, port string, timeout time.Duration) (string, error) {
 	if port == "80" {
 		scheme = "http"
 	}
-	urlHost := URLHost(host, port)
+	urlHost := URLHostForScheme(host, port, scheme)
 
 	proto, err := doHTTPGet(scheme, urlHost, timeout)
 	if err != nil && port != "80" && port != "443" {
@@ -281,7 +293,7 @@ func CheckHTTP(host, port string, timeout time.Duration) (string, error) {
 		if scheme == "http" {
 			alt = "https"
 		}
-		proto, err = doHTTPGet(alt, urlHost, timeout)
+		proto, err = doHTTPGet(alt, URLHostForScheme(host, port, alt), timeout)
 	}
 	return proto, err
 }

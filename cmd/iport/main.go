@@ -45,6 +45,8 @@ func isFlagPassed(name string) bool {
 }
 
 func main() {
+	ui.Reset()
+
 	// Workaround for Go's flag package stopping on the first non-flag argument.
 	if len(os.Args) > 2 && !strings.HasPrefix(os.Args[1], "-") {
 		arg := os.Args[1]

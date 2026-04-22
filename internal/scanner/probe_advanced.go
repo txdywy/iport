@@ -82,7 +82,9 @@ func probeReality(host, port string, timeout time.Duration) []ProbeResult {
 
 	shortTimeout := timeout / 3
 	info.Conn.SetWriteDeadline(time.Now().Add(shortTimeout))
-	info.Conn.Write(header)
+	if _, err := info.Conn.Write(header); err != nil {
+		return []ProbeResult{{Protocol: "VLESS+Reality", Transport: "TLS 1.3", Confidence: confidence}}
+	}
 
 	resp, _ := readWithTimeout(info.Conn, shortTimeout)
 	if len(resp) >= 2 && resp[0] == 0x00 {
@@ -122,13 +124,15 @@ func probeXTLSVision(host, port string, timeout time.Duration) []ProbeResult {
 	header = append(header, byte(len(addonPayload)))
 	header = append(header, addonPayload...)
 
-	header = append(header, 0x01)                       // cmd TCP
-	header = append(header, 0x00, 0x50)                 // port 80
-	header = append(header, 0x02, 0x0b)                 // domain, len 11
+	header = append(header, 0x01)       // cmd TCP
+	header = append(header, 0x00, 0x50) // port 80
+	header = append(header, 0x02, 0x0b) // domain, len 11
 	header = append(header, []byte("example.com")...)
 
 	conn.SetWriteDeadline(time.Now().Add(shortTimeout))
-	conn.Write(header)
+	if _, err := conn.Write(header); err != nil {
+		return nil
+	}
 
 	resp, err := readWithTimeout(conn, shortTimeout)
 	if len(resp) > 0 && resp[0] == 0x00 {
@@ -177,7 +181,9 @@ func probeShadowTLS(host, port string, timeout time.Duration) []ProbeResult {
 	randomData := make([]byte, 32)
 	rand.Read(randomData)
 	info.Conn.SetWriteDeadline(time.Now().Add(timeout / 3))
-	info.Conn.Write(randomData)
+	if _, err := info.Conn.Write(randomData); err != nil {
+		return []ProbeResult{{Protocol: "ShadowTLS", Transport: "TLS 1.3", Confidence: confidence}}
+	}
 
 	_, err = readWithTimeout(info.Conn, timeout/3)
 	if err != nil {
@@ -217,7 +223,9 @@ func probeAnyTLS(host, port string, timeout time.Duration) []ProbeResult {
 		data := make([]byte, size)
 		rand.Read(data)
 		conn.SetWriteDeadline(time.Now().Add(shortTimeout))
-		conn.Write(data)
+		if _, err := conn.Write(data); err != nil {
+			return probeOut{noData: true, gotClose: true}
+		}
 		start := time.Now()
 		resp, err := readWithTimeout(conn, shortTimeout)
 		elapsed := time.Since(start)
@@ -287,7 +295,10 @@ func probeNaiveProxy(host, port string, timeout time.Duration) []ProbeResult {
 	defer t.CloseIdleConnections()
 
 	url := "https://" + URLHost(host, port)
-	req, _ := http.NewRequest("CONNECT", url, nil)
+	req, err := http.NewRequest("CONNECT", url, nil)
+	if err != nil {
+		return nil
+	}
 	req.Host = "example.com:443"
 
 	client := &http.Client{Transport: t, Timeout: timeout}

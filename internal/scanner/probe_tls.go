@@ -46,7 +46,9 @@ func probeTrojan(host, port string, timeout time.Duration) []ProbeResult {
 		}
 		defer conn.Close()
 		conn.SetWriteDeadline(time.Now().Add(shortTimeout))
-		conn.Write(payload)
+		if _, err := conn.Write(payload); err != nil {
+			return probeOut{noData: true}
+		}
 		start := time.Now()
 		resp, _ := readWithTimeout(conn, shortTimeout)
 		ms := time.Since(start).Milliseconds()
@@ -127,7 +129,9 @@ func probeVLESS(host, port string, timeout time.Duration) []ProbeResult {
 		}
 		defer conn.Close()
 		conn.SetWriteDeadline(time.Now().Add(shortTimeout))
-		conn.Write(payload)
+		if _, err := conn.Write(payload); err != nil {
+			return probeOut{}
+		}
 		start := time.Now()
 		resp, _ := readWithTimeout(conn, shortTimeout)
 		return probeOut{resp: resp, latencyMs: time.Since(start).Milliseconds()}
@@ -139,10 +143,10 @@ func probeVLESS(host, port string, timeout time.Duration) []ProbeResult {
 	uuid := make([]byte, 16)
 	rand.Read(uuid)
 	vlessHeader = append(vlessHeader, uuid...)
-	vlessHeader = append(vlessHeader, 0x00)                       // addons length = 0
-	vlessHeader = append(vlessHeader, 0x01)                       // cmd: TCP
-	vlessHeader = append(vlessHeader, 0x00, 0x50)                 // port 80
-	vlessHeader = append(vlessHeader, 0x02, 0x0b)                 // domain, len 11
+	vlessHeader = append(vlessHeader, 0x00)       // addons length = 0
+	vlessHeader = append(vlessHeader, 0x01)       // cmd: TCP
+	vlessHeader = append(vlessHeader, 0x00, 0x50) // port 80
+	vlessHeader = append(vlessHeader, 0x02, 0x0b) // domain, len 11
 	vlessHeader = append(vlessHeader, []byte("example.com")...)
 
 	// Probe 2: Short payload (< 17 bytes)
@@ -202,7 +206,9 @@ func probeVMessTLS(host, port string, timeout time.Duration) []ProbeResult {
 	payload := make([]byte, 56)
 	rand.Read(payload)
 	conn.SetWriteDeadline(time.Now().Add(shortTimeout))
-	conn.Write(payload)
+	if _, err := conn.Write(payload); err != nil {
+		return nil
+	}
 
 	resp, err := readWithTimeout(conn, shortTimeout)
 
@@ -233,7 +239,9 @@ func probeSSTLS(host, port string, timeout time.Duration) []ProbeResult {
 	payload := make([]byte, 50)
 	rand.Read(payload)
 	conn.SetWriteDeadline(time.Now().Add(shortTimeout))
-	conn.Write(payload)
+	if _, err := conn.Write(payload); err != nil {
+		return nil
+	}
 
 	resp, err := readWithTimeout(conn, shortTimeout)
 	if len(resp) == 0 && err != nil {

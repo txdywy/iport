@@ -60,7 +60,9 @@ func doWSHandshake(conn net.Conn, host, path string, timeout time.Duration, tran
 
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
 		path, HostForHTTP(host), wsKey)
-	conn.Write([]byte(req))
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return nil
+	}
 
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadString('\n')
@@ -109,16 +111,18 @@ func detectWSInnerProtocol(conn net.Conn, transport, path string, timeout time.D
 	uuid := make([]byte, 16)
 	rand.Read(uuid)
 	header = append(header, uuid...)
-	header = append(header, 0x00)                       // addons len
-	header = append(header, 0x01)                       // cmd TCP
-	header = append(header, 0x00, 0x50)                 // port 80
-	header = append(header, 0x02, 0x0b)                 // domain type, len 11
+	header = append(header, 0x00)       // addons len
+	header = append(header, 0x01)       // cmd TCP
+	header = append(header, 0x00, 0x50) // port 80
+	header = append(header, 0x02, 0x0b) // domain type, len 11
 	header = append(header, []byte("example.com")...)
 
 	// Wrap in WebSocket binary frame
 	wsFrame := makeWSFrame(header)
 	conn.SetWriteDeadline(time.Now().Add(shortTimeout))
-	conn.Write(wsFrame)
+	if _, err := conn.Write(wsFrame); err != nil {
+		return nil
+	}
 
 	conn.SetReadDeadline(time.Now().Add(shortTimeout))
 	resp := make([]byte, 256)
@@ -183,6 +187,14 @@ func extractWSPayload(frame []byte) []byte {
 	if payloadLen == 126 && len(frame) >= 4 {
 		payloadLen = int(frame[2])<<8 | int(frame[3])
 		offset = 4
+	} else if payloadLen == 127 && len(frame) >= 10 {
+		if frame[2] != 0 || frame[3] != 0 || frame[4] != 0 || frame[5] != 0 {
+			return nil
+		}
+		payloadLen = int(frame[6])<<24 | int(frame[7])<<16 | int(frame[8])<<8 | int(frame[9])
+		offset = 10
+	} else if payloadLen >= 126 {
+		return nil
 	}
 	masked := frame[1]&0x80 != 0
 	if masked {
@@ -216,7 +228,10 @@ func probeGRPC(host, port string, timeout time.Duration) []ProbeResult {
 
 	for _, svc := range []string{"/grpc", "/GunService/Tun", "/vless", "/vmess"} {
 		url := "https://" + URLHost(host, port) + svc
-		req, _ := http.NewRequest("POST", url, nil)
+		req, err := http.NewRequest("POST", url, nil)
+		if err != nil {
+			continue
+		}
 		req.Header.Set("Content-Type", "application/grpc")
 		req.Header.Set("TE", "trailers")
 
@@ -263,7 +278,10 @@ func probeHTTPUpgrade(host, port string, timeout time.Duration) []ProbeResult {
 
 		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
 			path, HostForHTTP(host), wsKey)
-		conn.Write([]byte(req))
+		if _, err := conn.Write([]byte(req)); err != nil {
+			conn.Close()
+			continue
+		}
 
 		reader := bufio.NewReader(conn)
 		line, err := reader.ReadString('\n')
@@ -293,7 +311,10 @@ func probeXHTTP(host, port string, timeout time.Duration) []ProbeResult {
 		url := "https://" + URLHost(host, port) + path
 
 		// Try POST — XHTTP servers accept POST and stream response
-		req, _ := http.NewRequest("POST", url, strings.NewReader(""))
+		req, err := http.NewRequest("POST", url, strings.NewReader(""))
+		if err != nil {
+			continue
+		}
 		req.Header.Set("Content-Type", "application/octet-stream")
 		resp, err := client.Do(req)
 		if err != nil {

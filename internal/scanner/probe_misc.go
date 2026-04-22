@@ -144,7 +144,9 @@ func probeBrookWS(host, port string, timeout time.Duration) []ProbeResult {
 	rand.Read(keyBytes)
 	wsKey := base64.StdEncoding.EncodeToString(keyBytes)
 	req := fmt.Sprintf("GET /ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", HostForHTTP(host), wsKey)
-	conn.Write([]byte(req))
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return nil
+	}
 
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadString('\n')
@@ -173,7 +175,9 @@ func probeBrookTCP(host, port string, timeout time.Duration) []ProbeResult {
 	payload := make([]byte, 32)
 	rand.Read(payload)
 	conn.SetWriteDeadline(time.Now().Add(shortTimeout))
-	conn.Write(payload)
+	if _, err := conn.Write(payload); err != nil {
+		return nil
+	}
 
 	conn.SetReadDeadline(time.Now().Add(shortTimeout))
 	resp := make([]byte, 256)
