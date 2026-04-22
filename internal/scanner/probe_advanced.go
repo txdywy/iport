@@ -32,44 +32,61 @@ func probeReality(host, port string, timeout time.Duration) []ProbeResult {
 	}
 	defer info.Conn.Close()
 
-	// Reality requires TLS 1.3
 	if info.Version != tls.VersionTLS13 {
 		return nil
 	}
 
-	// Check cert mismatch — the key Reality signal
 	if CertMatchesHost(info, host) {
-		return nil // Cert matches, not Reality
+		return nil
 	}
 
 	confidence := 40.0
 
-	// Reality uses specific cipher suites
 	switch info.CipherSuite {
 	case tls.TLS_AES_128_GCM_SHA256, tls.TLS_AES_256_GCM_SHA384, tls.TLS_CHACHA20_POLY1305_SHA256:
-		confidence += 10
+		confidence += 5
 	}
 
-	// Try VLESS probe over this TLS connection to confirm
+	// IP-vs-SNI mismatch: resolve the cert's domain and compare with target IP.
+	// Reality borrows certs from real sites, so the cert domain resolves to different IPs.
+	targetIPs, _ := net.LookupIP(host)
+	certDomain := info.CertCN
+	if len(info.CertSANs) > 0 {
+		certDomain = info.CertSANs[0]
+	}
+	if certDomain != "" {
+		certIPs, err := net.LookupIP(certDomain)
+		if err == nil && len(certIPs) > 0 && len(targetIPs) > 0 {
+			match := false
+			for _, tip := range targetIPs {
+				for _, cip := range certIPs {
+					if tip.Equal(cip) {
+						match = true
+					}
+				}
+			}
+			if !match {
+				confidence += 15 // cert domain resolves to different IP → strong Reality signal
+			}
+		}
+	}
+
+	// VLESS probe over this connection
 	header := make([]byte, 0, 64)
-	header = append(header, 0x00) // VLESS version
+	header = append(header, 0x00)
 	uuid := make([]byte, 16)
 	rand.Read(uuid)
 	header = append(header, uuid...)
-	header = append(header, 0x00)                       // addons len
-	header = append(header, 0x01)                       // cmd TCP
-	header = append(header, 0x00, 0x50)                 // port 80
-	header = append(header, 0x02, 0x0b)                 // domain, len 11
+	header = append(header, 0x00, 0x01, 0x00, 0x50, 0x02, 0x0b)
 	header = append(header, []byte("example.com")...)
 
 	shortTimeout := timeout / 3
 	info.Conn.SetWriteDeadline(time.Now().Add(shortTimeout))
 	info.Conn.Write(header)
 
-	resp, err := readWithTimeout(info.Conn, shortTimeout)
-	if len(resp) == 0 && err != nil {
-		// Silent close on invalid UUID — consistent with VLESS+Reality
-		confidence += 10
+	resp, _ := readWithTimeout(info.Conn, shortTimeout)
+	if len(resp) >= 2 && resp[0] == 0x00 {
+		confidence += 15 // got VLESS response
 	}
 
 	return []ProbeResult{{Protocol: "VLESS+Reality", Transport: "TLS 1.3", Confidence: confidence}}
@@ -175,45 +192,72 @@ func probeShadowTLS(host, port string, timeout time.Duration) []ProbeResult {
 // AnyTLS maintains a pool of TLS sessions and multiplexes connections.
 // Detection: make multiple rapid TLS connections and check for session reuse patterns.
 func probeAnyTLS(host, port string, timeout time.Duration) []ProbeResult {
-	// First connection — establish baseline
-	info1, err := AnalyzeTLS(host, port, timeout)
-	if err != nil {
-		return nil
-	}
-	info1.Conn.Close()
+	// AnyTLS: after TLS, client sends sha256(password) (32 bytes) + padding_length (2B) + padding.
+	// Detection: send <32 bytes → server waits for more (timeout).
+	// Send >=32 bytes random → server fails auth, closes or falls back.
+	// Compare behavior.
 
-	// Second connection — check for session ticket reuse
-	info2, err := AnalyzeTLS(host, port, timeout)
-	if err != nil {
-		return nil
+	shortTimeout := timeout / 3
+	if shortTimeout < 500*time.Millisecond {
+		shortTimeout = 500 * time.Millisecond
 	}
-	defer info2.Conn.Close()
+
+	type probeOut struct {
+		noData    bool
+		gotClose  bool
+		latencyMs int64
+	}
+
+	doProbe := func(size int) probeOut {
+		conn, err := dialTLSRaw(host, port, timeout)
+		if err != nil {
+			return probeOut{noData: true, gotClose: true}
+		}
+		defer conn.Close()
+		data := make([]byte, size)
+		rand.Read(data)
+		conn.SetWriteDeadline(time.Now().Add(shortTimeout))
+		conn.Write(data)
+		start := time.Now()
+		resp, err := readWithTimeout(conn, shortTimeout)
+		elapsed := time.Since(start)
+		return probeOut{
+			noData:    len(resp) == 0,
+			gotClose:  err != nil && elapsed < shortTimeout-100*time.Millisecond,
+			latencyMs: elapsed.Milliseconds(),
+		}
+	}
+
+	ch1 := make(chan probeOut, 1) // short: 16 bytes (< 32 auth threshold)
+	ch2 := make(chan probeOut, 1) // full: 48 bytes (>= 32 auth + padding header)
+	go func() { ch1 <- doProbe(16) }()
+	go func() { ch2 <- doProbe(48) }()
+
+	short, full := <-ch1, <-ch2
 
 	confidence := 0.0
 
-	// AnyTLS uses TLS with session pooling
-	if info1.Version == tls.VersionTLS13 && info2.Version == tls.VersionTLS13 {
-		confidence += 20
+	// AnyTLS signature: short probe times out (server waiting for 32B), full probe closes quickly
+	if short.noData && !short.gotClose && full.noData && full.gotClose {
+		confidence = 60 // server buffered short, rejected full
+	} else if short.noData && !short.gotClose && full.noData && !full.gotClose {
+		confidence = 50 // both timeout — server waiting for valid framing
+	} else if short.latencyMs > full.latencyMs+100 {
+		confidence = 45 // short notably slower than full
 	}
 
-	// Check cert mismatch (AnyTLS may or may not use its own cert)
-	if !CertMatchesHost(info2, host) {
-		confidence += 10
+	// Also check cert mismatch
+	if confidence > 0 {
+		info, err := AnalyzeTLS(host, port, timeout)
+		if err == nil {
+			if !CertMatchesHost(info, host) {
+				confidence += 10
+			}
+			info.Conn.Close()
+		}
 	}
 
-	// Send random data — AnyTLS expects its own framing protocol
-	randomData := make([]byte, 32)
-	rand.Read(randomData)
-	info2.Conn.SetWriteDeadline(time.Now().Add(timeout / 3))
-	info2.Conn.Write(randomData)
-
-	_, err = readWithTimeout(info2.Conn, timeout/3)
-	if err != nil {
-		// Connection closed on invalid framing — consistent with AnyTLS
-		confidence += 15
-	}
-
-	if confidence >= 35 {
+	if confidence >= 40 {
 		return []ProbeResult{{Protocol: "AnyTLS", Transport: "TLS", Confidence: confidence}}
 	}
 	return nil
