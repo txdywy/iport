@@ -13,6 +13,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 const (
@@ -116,13 +117,15 @@ func CheckUDP(host, port string, timeout time.Duration) error {
 	return nil
 }
 
-// Ping sends an ICMP Echo Request, trying unprivileged UDP ping first,
-// then falling back to raw socket (requires root).
+// Ping sends an ICMP Echo Request, supporting both IPv4 and IPv6.
+// Tries unprivileged UDP ping first, then falls back to raw socket.
 func Ping(host string, timeout time.Duration) (time.Duration, error) {
 	ips, err := net.LookupIP(host)
 	if err != nil {
 		return 0, err
 	}
+
+	// Prefer IPv4, fall back to IPv6
 	var ip net.IP
 	for _, i := range ips {
 		if i.To4() != nil {
@@ -131,39 +134,70 @@ func Ping(host string, timeout time.Duration) (time.Duration, error) {
 		}
 	}
 	if ip == nil {
-		return 0, fmt.Errorf("no IPv4 address found")
+		for _, i := range ips {
+			if i.To16() != nil {
+				ip = i
+				break
+			}
+		}
+	}
+	if ip == nil {
+		return 0, fmt.Errorf("no IP address found")
 	}
 
-	// Try unprivileged UDP ping first (works without root on most systems)
-	if rtt, err := pingUDP(ip, timeout); err == nil {
+	isV6 := ip.To4() == nil
+
+	// Try unprivileged UDP ping first
+	if rtt, err := pingUDP(ip, isV6, timeout); err == nil {
 		return rtt, nil
 	}
 
 	// Fallback to raw ICMP socket (requires root/CAP_NET_RAW)
-	return pingRaw(ip, timeout)
+	return pingRaw(ip, isV6, timeout)
 }
 
-func pingUDP(ip net.IP, timeout time.Duration) (time.Duration, error) {
-	c, err := icmp.ListenPacket("udp4", "0.0.0.0")
+func pingUDP(ip net.IP, isV6 bool, timeout time.Duration) (time.Duration, error) {
+	network, listen := "udp4", "0.0.0.0"
+	if isV6 {
+		network, listen = "udp6", "::"
+	}
+	c, err := icmp.ListenPacket(network, listen)
 	if err != nil {
 		return 0, err
 	}
 	defer c.Close()
-	return doPing(c, &net.UDPAddr{IP: ip}, timeout)
+	return doPing(c, &net.UDPAddr{IP: ip}, isV6, timeout)
 }
 
-func pingRaw(ip net.IP, timeout time.Duration) (time.Duration, error) {
-	c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+func pingRaw(ip net.IP, isV6 bool, timeout time.Duration) (time.Duration, error) {
+	network, listen := "ip4:icmp", "0.0.0.0"
+	if isV6 {
+		network, listen = "ip6:ipv6-icmp", "::"
+	}
+	c, err := icmp.ListenPacket(network, listen)
 	if err != nil {
 		return 0, fmt.Errorf("ping requires root privileges or unprivileged ICMP support")
 	}
 	defer c.Close()
-	return doPing(c, &net.IPAddr{IP: ip}, timeout)
+	return doPing(c, &net.IPAddr{IP: ip}, isV6, timeout)
 }
 
-func doPing(c *icmp.PacketConn, dst net.Addr, timeout time.Duration) (time.Duration, error) {
+func doPing(c *icmp.PacketConn, dst net.Addr, isV6 bool, timeout time.Duration) (time.Duration, error) {
+	var msgType icmp.Type
+	var replyType icmp.Type
+	var proto int
+	if isV6 {
+		msgType = ipv6.ICMPTypeEchoRequest
+		replyType = ipv6.ICMPTypeEchoReply
+		proto = 58 // ICMPv6
+	} else {
+		msgType = ipv4.ICMPTypeEcho
+		replyType = ipv4.ICMPTypeEchoReply
+		proto = 1 // ICMPv4
+	}
+
 	wm := icmp.Message{
-		Type: ipv4.ICMPTypeEcho, Code: 0,
+		Type: msgType, Code: 0,
 		Body: &icmp.Echo{
 			ID: os.Getpid() & 0xffff, Seq: 1,
 			Data: []byte("HELLO-IPORT"),
@@ -187,11 +221,11 @@ func doPing(c *icmp.PacketConn, dst net.Addr, timeout time.Duration) (time.Durat
 	}
 	rtt := time.Since(start)
 
-	rm, err := icmp.ParseMessage(ipv4.ICMPTypeEchoReply.Protocol(), rb[:n])
+	rm, err := icmp.ParseMessage(proto, rb[:n])
 	if err != nil {
 		return 0, err
 	}
-	if rm.Type == ipv4.ICMPTypeEchoReply {
+	if rm.Type == replyType {
 		return rtt, nil
 	}
 	return 0, fmt.Errorf("unexpected ICMP type: %v", rm.Type)
