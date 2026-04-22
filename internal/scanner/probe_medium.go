@@ -16,18 +16,16 @@ func init() {
 
 // probeShadowsocks detects Shadowsocks (legacy AEAD and 2022) by multi-probe behavioral analysis.
 //
-// Key insight from SIP022 spec §3.1.4 "Detection Prevention":
-// - SS2022 servers MUST NOT close immediately on invalid data — they drain/read-forever
-// - SS2022 uses fixed salt sizes: 16 bytes (AES-128-GCM) or 32 bytes (AES-256-GCM)
-// - Server reads exactly salt + fixed-header-chunk before AEAD validation
+// Key insight: SS runs on RAW TCP (not TLS). So if a port accepts TLS handshake → NOT SS.
+// SS2022 servers either "read forever" (drain) or RST via SO_LINGER on invalid data.
+// But many normal services also timeout or RST on garbage, so we need multiple signals:
 //
-// Detection strategy (3 concurrent probes):
-// 1. Send short data (< min salt size) → SS waits for more data (timeout, no close)
-// 2. Send medium data (50 bytes, covers both salt sizes) → SS reads, fails AEAD, drains
-// 3. Send HTTP GET → SS treats as random data, same drain behavior (no HTTP response)
+// Probe 1: TLS handshake attempt → if succeeds, eliminate SS (it's a TLS service)
+// Probe 2: Short random data (8B) → SS waits/drains, normal services may respond
+// Probe 3: Medium random data (50B) → SS fails AEAD, drains/RSTs
+// Probe 4: HTTP GET → normal HTTP servers respond, SS treats as random data
 //
-// If all 3 probes show "no response, no close" or "drain" behavior, and probe 3
-// does NOT return HTTP → strong SS signal. Normal services would respond to HTTP.
+// SS signature: TLS fails + no data on random probes + no HTTP response
 func probeShadowsocks(host, port string, timeout time.Duration) []ProbeResult {
 	shortTimeout := timeout / 3
 	if shortTimeout < 500*time.Millisecond {
@@ -35,12 +33,11 @@ func probeShadowsocks(host, port string, timeout time.Duration) []ProbeResult {
 	}
 
 	type probeResult struct {
-		gotData   bool
-		gotClose  bool // connection closed/reset before timeout
-		gotRST    bool // connection reset (RST) specifically
-		gotHTTP   bool
-		entropy   float64
-		closeTime time.Duration
+		gotData  bool
+		gotClose bool
+		gotRST   bool
+		gotHTTP  bool
+		entropy  float64
 	}
 
 	doProbe := func(payload []byte) probeResult {
@@ -49,19 +46,16 @@ func probeShadowsocks(host, port string, timeout time.Duration) []ProbeResult {
 			return probeResult{gotClose: true}
 		}
 		defer conn.Close()
-
 		conn.SetWriteDeadline(time.Now().Add(shortTimeout))
 		if _, err := conn.Write(payload); err != nil {
 			return probeResult{gotClose: true}
 		}
-
 		start := time.Now()
 		conn.SetReadDeadline(time.Now().Add(shortTimeout))
 		resp := make([]byte, 512)
 		n, err := conn.Read(resp)
 		elapsed := time.Since(start)
-
-		r := probeResult{closeTime: elapsed}
+		r := probeResult{}
 		if n > 0 {
 			r.gotData = true
 			r.entropy = ShannonEntropy(resp[:n])
@@ -70,97 +64,102 @@ func probeShadowsocks(host, port string, timeout time.Duration) []ProbeResult {
 			}
 		}
 		if err != nil {
-			errStr := err.Error()
-			if elapsed < shortTimeout-100*time.Millisecond {
-				r.gotClose = true
-			}
-			// Detect RST specifically — SS2022 SO_LINGER(0) strategy
-			if strings.Contains(errStr, "connection reset") {
+			if strings.Contains(err.Error(), "connection reset") {
 				r.gotClose = true
 				r.gotRST = true
+			} else if elapsed < shortTimeout-100*time.Millisecond {
+				r.gotClose = true
 			}
 		}
 		return r
 	}
 
-	// Run 3 probes concurrently
-	ch1 := make(chan probeResult, 1)
-	ch2 := make(chan probeResult, 1)
-	ch3 := make(chan probeResult, 1)
+	// Run all 4 probes concurrently
+	chTLS := make(chan bool, 1)       // true = TLS handshake succeeded
+	ch1 := make(chan probeResult, 1)  // 8B random
+	ch2 := make(chan probeResult, 1)  // 50B random
+	ch3 := make(chan probeResult, 1)  // HTTP GET
 
-	// Probe 1: Short payload (8 bytes — less than any SS salt size)
+	// Probe 0: TLS handshake — if succeeds, this is a TLS service, NOT raw SS
+	go func() {
+		conn, err := dialTLSRaw(host, port, timeout)
+		if err == nil {
+			conn.Close()
+			chTLS <- true
+		} else {
+			// Distinguish "TLS rejected" (connection worked but handshake failed)
+			// from "can't connect" (timeout/network issue)
+			errStr := err.Error()
+			if strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline") {
+				chTLS <- true // treat timeout as "might be TLS" → not SS
+			} else {
+				chTLS <- false // TLS explicitly rejected → could be raw SS
+			}
+		}
+	}()
+
 	go func() {
 		p := make([]byte, 8)
 		rand.Read(p)
 		ch1 <- doProbe(p)
 	}()
-
-	// Probe 2: Medium payload (50 bytes — covers 32-byte salt + partial header)
 	go func() {
 		p := make([]byte, 50)
 		rand.Read(p)
 		ch2 <- doProbe(p)
 	}()
-
-	// Probe 3: HTTP GET — normal HTTP servers respond, SS treats as random data
 	go func() {
 		ch3 <- doProbe([]byte("GET / HTTP/1.1\r\nHost: test\r\n\r\n"))
 	}()
 
+	tlsOK := <-chTLS
 	r1, r2, r3 := <-ch1, <-ch2, <-ch3
 
-	confidence := 0.0
-
-	// SS2022 signature: server drains on all probes (no data back, no quick close)
-	// "no data, no close" = timeout on read = server is draining/reading-forever
-	noDataNoClose := func(r probeResult) bool {
-		return !r.gotData && !r.gotClose
+	// CRITICAL: if TLS handshake succeeded, this is NOT raw Shadowsocks
+	// (SS-over-TLS is handled by a separate probe in probe_tls.go)
+	if tlsOK {
+		return nil
 	}
 
-	if noDataNoClose(r1) && noDataNoClose(r2) && noDataNoClose(r3) {
-		// All 3 probes: server absorbed data silently and kept connection open
-		// This is the classic SS2022 "read forever" / "shutdown(SHUT_WR)" behavior
-		confidence = 80
-	} else if noDataNoClose(r1) && noDataNoClose(r2) && !r3.gotHTTP {
-		// Short + medium absorbed, HTTP probe also no HTTP response
-		confidence = 75
-	} else if !r1.gotData && !r2.gotData && !r3.gotData && r1.gotRST && r2.gotRST && r3.gotRST {
-		// All 3 probes: no data, all RST — SS2022 SO_LINGER(0) strategy
-		// Server reads data, fails AEAD, immediately RSTs
-		confidence = 75
-	} else if !r1.gotData && !r2.gotData && !r3.gotHTTP && r2.gotRST {
-		// Medium probe RST, no HTTP response — likely SS with SO_LINGER
-		confidence = 65
-	} else if !r1.gotData && !r2.gotData && !r3.gotHTTP {
-		// No data on any probe, HTTP didn't get HTTP response
-		if r1.gotClose && r2.gotClose {
-			// Both closed quickly — legacy SS AEAD or SS2022
-			confidence = 55
-		} else {
-			confidence = 50
-		}
-	} else if !r2.gotData && r2.gotClose && !r3.gotHTTP && r3.gotClose {
-		confidence = 40
-	}
-
-	// Negative signal: if HTTP probe got actual HTTP response, it's not SS
+	// Negative: if HTTP probe got HTTP response, it's an HTTP service
 	if r3.gotHTTP {
 		return nil
 	}
 
-	// Negative signal: if any probe got low-entropy data, it's likely a normal service
+	// Negative: if any probe got low-entropy data, it's a normal service with a banner
 	for _, r := range []probeResult{r1, r2, r3} {
 		if r.gotData && r.entropy < 6.0 {
 			return nil
 		}
 	}
 
+	confidence := 0.0
+	noDataNoClose := func(r probeResult) bool { return !r.gotData && !r.gotClose }
+
+	// SS2022 "read forever" / drain: all probes timeout with no data, no close
+	if noDataNoClose(r1) && noDataNoClose(r2) && noDataNoClose(r3) {
+		confidence = 75
+	} else if noDataNoClose(r1) && noDataNoClose(r2) {
+		confidence = 65
+	} else if !r1.gotData && !r2.gotData && r1.gotRST && r2.gotRST {
+		// SS2022 SO_LINGER: RST on both random probes, no data
+		// But also need HTTP probe to NOT get RST (to distinguish from generic RST services)
+		if !r3.gotRST {
+			confidence = 65
+		} else {
+			// All RST including HTTP → could be any non-HTTP service (DNS, Redis, etc.)
+			// Much weaker signal
+			confidence = 35
+		}
+	} else if !r1.gotData && !r2.gotData && r1.gotClose && r2.gotClose {
+		// Legacy SS: silent close on both
+		confidence = 45
+	}
+
 	if confidence >= 40 {
 		proto := "Shadowsocks"
 		if noDataNoClose(r1) && noDataNoClose(r2) {
-			proto = "Shadowsocks (2022)" // SS2022's distinctive drain behavior
-		} else if r1.gotRST && r2.gotRST && r3.gotRST && !r1.gotData && !r2.gotData && !r3.gotData {
-			proto = "Shadowsocks (2022)" // SS2022's SO_LINGER RST behavior
+			proto = "Shadowsocks (2022)"
 		}
 		return []ProbeResult{{Protocol: proto, Transport: "TCP", Confidence: confidence}}
 	}
