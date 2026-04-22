@@ -57,10 +57,10 @@ iport example.com -probe=false
 iport -list-probes
 
 # Scan all 65535 TCP+UDP ports (proxy detection auto-disabled for performance)
-iport example.com -A
+iport example.com -A -U
 
 # Scan all ports, TCP only
-iport example.com -A -T
+iport example.com -A
 
 # Adjust timeout (in milliseconds)
 iport example.com -timeout 5000
@@ -76,8 +76,9 @@ iport example.com -A -c 2000
 | `-t` | | Target IP or domain |
 | `-p` | `80,443` | Ports to scan (comma separated, validated 1-65535) |
 | `-timeout` | `2000` | Timeout in milliseconds |
-| `-A` | `false` | Scan all 65535 TCP+UDP ports |
+| `-A` | `false` | Scan all 65535 ports (TCP only; add -U for UDP) |
 | `-T` | `false` | TCP only, skip UDP scanning and HTTP/3 |
+| `-U` | `false` | Include UDP scanning (use with -A for full TCP+UDP) |
 | `-c` | `1000` | Maximum concurrent scans |
 | `-probe` | `true` | Enable proxy protocol detection |
 | `-probe-only` | `false` | Skip TLS/HTTP, only run proxy probes |

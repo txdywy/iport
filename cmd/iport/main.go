@@ -44,6 +44,7 @@ func main() {
 		showVersion bool
 		allPorts    bool
 		tcpOnly     bool
+		udpScan     bool
 		concurrency int
 		probeProxy  bool
 		probeOnly   bool
@@ -54,8 +55,9 @@ func main() {
 	flag.StringVar(&ports, "p", "", "Ports to scan (comma separated, default: 80,443)")
 	flag.IntVar(&timeoutMs, "timeout", 2000, "Timeout in milliseconds")
 	flag.BoolVar(&showVersion, "V", false, "Show version and exit")
-	flag.BoolVar(&allPorts, "A", false, "Scan all 65535 TCP+UDP ports")
-	flag.BoolVar(&tcpOnly, "T", false, "TCP only, skip UDP scanning")
+	flag.BoolVar(&allPorts, "A", false, "Scan all 65535 ports")
+	flag.BoolVar(&tcpOnly, "T", false, "TCP only, skip UDP scanning and HTTP/3")
+	flag.BoolVar(&udpScan, "U", false, "Include UDP scanning (use with -A for full TCP+UDP)")
 	flag.IntVar(&concurrency, "c", 1000, "Maximum concurrent scans")
 	flag.BoolVar(&probeProxy, "probe", true, "Enable proxy protocol detection")
 	flag.BoolVar(&probeOnly, "probe-only", false, "Skip TLS/HTTP, only run proxy probes")
@@ -113,7 +115,13 @@ func main() {
 		}
 	}
 
-	scanUDP := !tcpOnly
+	// UDP scanning: on by default for specific ports, off for -A (use -U to enable), off for -T
+	scanUDP := true
+	if tcpOnly {
+		scanUDP = false
+	} else if allPorts && !udpScan {
+		scanUDP = false // -A defaults to TCP-only for performance; -A -U enables UDP
+	}
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	bigScan := len(portList) > 100
 
