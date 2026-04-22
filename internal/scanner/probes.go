@@ -47,6 +47,39 @@ func CheckTCP(host string, port string, timeout time.Duration) error {
 	return nil
 }
 
+// CheckUDP attempts to send an empty packet to a UDP port and waits for an ICMP unreachable
+// Note: This is a basic UDP check. Many firewalls silently drop UDP packets.
+func CheckUDP(host string, port string, timeout time.Duration) error {
+	target := net.JoinHostPort(host, port)
+	conn, err := net.DialTimeout("udp", target, timeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Send an empty packet
+	_, err = conn.Write([]byte(""))
+	if err != nil {
+		return err
+	}
+
+	// Set read deadline
+	conn.SetReadDeadline(time.Now().Add(timeout))
+
+	// Try to read anything back. If it's a timeout, it might be open but silently dropping,
+	// or filtered. If we get connection refused, it's definitively closed.
+	buffer := make([]byte, 1024)
+	_, err = conn.Read(buffer)
+	if err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			// Timeout is often the best we get for an open or filtered UDP port
+			return fmt.Errorf("timeout (open|filtered)")
+		}
+		return err
+	}
+	return nil
+}
+
 // Ping sends an ICMP Echo Request
 func Ping(host string, timeout time.Duration) (error, time.Duration) {
 	// Resolve IP

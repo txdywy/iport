@@ -58,7 +58,7 @@ func main() {
 		ui.PrintResult("ICMP Ping", err, fmt.Sprintf("RTT: %v", rtt))
 	}()
 
-	// TCP Ports
+	// TCP and UDP Ports
 	for _, p := range portList {
 		wg.Add(1)
 		port := strings.TrimSpace(p)
@@ -66,6 +66,18 @@ func main() {
 			defer wg.Done()
 			err := scanner.CheckTCP(target, port, timeout)
 			ui.PrintResult(fmt.Sprintf("TCP Port %s", port), err, "Open")
+		}(port)
+
+		wg.Add(1)
+		go func(port string) {
+			defer wg.Done()
+			err := scanner.CheckUDP(target, port, timeout)
+			// For UDP, timeout often means it's open but ignoring us, or filtered.
+			if err != nil && strings.Contains(err.Error(), "timeout") {
+				ui.PrintResult(fmt.Sprintf("UDP Port %s", port), fmt.Errorf("timeout (open|filtered)"), "")
+			} else {
+				ui.PrintResult(fmt.Sprintf("UDP Port %s", port), err, "Open")
+			}
 		}(port)
 	}
 
