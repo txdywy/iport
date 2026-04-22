@@ -55,9 +55,9 @@ func main() {
 	flag.StringVar(&ports, "p", "", "Ports to scan (comma separated, default: 80,443)")
 	flag.IntVar(&timeoutMs, "timeout", 2000, "Timeout in milliseconds")
 	flag.BoolVar(&showVersion, "V", false, "Show version and exit")
-	flag.BoolVar(&allPorts, "A", false, "Scan all 65535 ports")
-	flag.BoolVar(&tcpOnly, "T", false, "TCP only, skip UDP scanning and HTTP/3")
-	flag.BoolVar(&udpScan, "U", false, "UDP only, skip TCP scanning")
+	flag.BoolVar(&allPorts, "A", false, "Scan all 65535 ports (TCP+UDP, equivalent to -T -U)")
+	flag.BoolVar(&tcpOnly, "T", false, "Enable TCP scanning")
+	flag.BoolVar(&udpScan, "U", false, "Enable UDP scanning")
 	flag.IntVar(&concurrency, "c", 1000, "Maximum concurrent scans")
 	flag.BoolVar(&probeProxy, "probe", true, "Enable proxy protocol detection")
 	flag.BoolVar(&probeOnly, "probe-only", false, "Skip TLS/HTTP, only run proxy probes")
@@ -115,20 +115,27 @@ func main() {
 		}
 	}
 
-	// Scan mode: -T = TCP only, -U = UDP only, neither = both
-	// -A -U = all UDP ports, -A -T = all TCP ports, -A = all TCP ports (default)
+	// Scan mode:
+	// -T = TCP, -U = UDP, -T -U = both, -A = all ports TCP+UDP
+	// No -T/-U/-A = default TCP+UDP on specified ports
 	scanTCP := true
 	scanUDP := true
-	if tcpOnly && udpScan {
-		fmt.Println("Error: -T and -U are mutually exclusive. Use neither for TCP+UDP.")
-		os.Exit(1)
+	if tcpOnly || udpScan {
+		// Explicit mode: only scan what's requested
+		scanTCP = tcpOnly
+		scanUDP = udpScan
 	}
-	if tcpOnly {
-		scanUDP = false
-	} else if udpScan {
-		scanTCP = false
-	} else if allPorts {
-		scanUDP = false // -A alone defaults to TCP only for performance
+	if allPorts {
+		// -A = all ports, implies both TCP+UDP
+		scanTCP = true
+		scanUDP = true
+		// But respect -T/-U if explicitly given with -A
+		if tcpOnly && !udpScan {
+			scanUDP = false
+		}
+		if udpScan && !tcpOnly {
+			scanTCP = false
+		}
 	}
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	bigScan := len(portList) > 100
@@ -331,7 +338,7 @@ func main() {
 					appResults = append(appResults, r)
 					appMu.Unlock()
 				}()
-				if !tcpOnly {
+				if scanUDP {
 					appWG.Add(1)
 					go func() {
 						defer appWG.Done()
