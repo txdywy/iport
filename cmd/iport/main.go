@@ -179,10 +179,14 @@ func main() {
 		}
 	}()
 
-	emit := func(r ScanResult) { results <- r }
+	var emitMu sync.Mutex
+	emit := func(r ScanResult) {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+		results <- r
+	}
 
 	// emitBatch sends multiple results atomically — no interleaving from other goroutines.
-	var emitMu sync.Mutex
 	emitBatch := func(batch []ScanResult) {
 		emitMu.Lock()
 		defer emitMu.Unlock()

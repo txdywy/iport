@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/txdywy/iport/internal/netutil"
 	"golang.org/x/net/dns/dnsmessage"
 )
 
@@ -78,6 +79,11 @@ type Options struct {
 	Timeout time.Duration
 }
 
+type runner struct {
+	timeout   time.Duration
+	dohClient *http.Client
+}
+
 type EventKind string
 
 const (
@@ -103,6 +109,17 @@ func CheckWithEvents(ctx context.Context, raw string, opts Options, emit func(Ev
 	if opts.Timeout <= 0 {
 		opts.Timeout = 2 * time.Second
 	}
+	r := runner{
+		timeout: opts.Timeout,
+		dohClient: &http.Client{
+			Timeout: opts.Timeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        8,
+				MaxIdleConnsPerHost: 4,
+				IdleConnTimeout:     30 * time.Second,
+			},
+		},
+	}
 	target, err := ParseTarget(raw)
 	if err != nil {
 		return nil, err
@@ -112,7 +129,7 @@ func CheckWithEvents(ctx context.Context, raw string, opts Options, emit func(Ev
 	emitEvent(emit, Event{Kind: EventStart, Target: target})
 
 	emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "DNS"})
-	dnsLayer, systemIPs, controlIPs := checkDNS(ctx, target.Host, opts.Timeout)
+	dnsLayer, systemIPs, controlIPs := r.checkDNS(ctx, target.Host)
 	d.Layers = append(d.Layers, dnsLayer)
 	emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: dnsLayer})
 
@@ -128,20 +145,20 @@ func CheckWithEvents(ctx context.Context, raw string, opts Options, emit func(Ev
 	}
 
 	emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "TCP"})
-	tcpLayer := checkTCP(ctx, testIPs, target.Port, opts.Timeout)
+	tcpLayer := r.checkTCP(ctx, testIPs, target.Port)
 	d.Layers = append(d.Layers, tcpLayer)
 	emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: tcpLayer})
 
 	tlsLayer := LayerResult{Name: "TLS/SNI", Status: "skipped", Summary: "Target scheme does not require TLS."}
 	if target.Port == "443" {
 		emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "TLS/SNI"})
-		tlsLayer = checkTLS(ctx, target.Host, testIPs, target.Port, opts.Timeout)
+		tlsLayer = r.checkTLS(ctx, target.Host, testIPs, target.Port)
 		d.Layers = append(d.Layers, tlsLayer)
 		emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: tlsLayer})
 	}
 
 	emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "HTTP"})
-	httpLayer := checkHTTP(ctx, target, testIPs, opts.Timeout)
+	httpLayer := r.checkHTTP(ctx, target, testIPs)
 	d.Layers = append(d.Layers, httpLayer)
 	emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: httpLayer})
 	if httpLayer.Status != "ok" && !target.ExplicitURL && target.Scheme == "https" {
@@ -149,12 +166,12 @@ func CheckWithEvents(ctx context.Context, raw string, opts Options, emit func(Ev
 		fallbackTarget.Scheme = "http"
 		fallbackTarget.Port = "80"
 		emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "TCP HTTP fallback"})
-		tcp80Layer := checkTCP(ctx, testIPs, fallbackTarget.Port, opts.Timeout)
+		tcp80Layer := r.checkTCP(ctx, testIPs, fallbackTarget.Port)
 		tcp80Layer.Name = "TCP HTTP fallback"
 		d.Layers = append(d.Layers, tcp80Layer)
 		emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: tcp80Layer})
 		emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "HTTP fallback"})
-		fallbackHTTP := checkHTTP(ctx, fallbackTarget, testIPs, opts.Timeout)
+		fallbackHTTP := r.checkHTTP(ctx, fallbackTarget, testIPs)
 		fallbackHTTP.Name = "HTTP fallback"
 		d.Layers = append(d.Layers, fallbackHTTP)
 		emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: fallbackHTTP})
@@ -166,7 +183,7 @@ func CheckWithEvents(ctx context.Context, raw string, opts Options, emit func(Ev
 	quicLayer := LayerResult{Name: "HTTP/3 QUIC/SNI", Status: "skipped", Summary: "QUIC is only checked for HTTPS targets."}
 	if target.Port == "443" {
 		emitEvent(emit, Event{Kind: EventLayerStart, Target: target, LayerName: "HTTP/3 QUIC/SNI"})
-		quicLayer = checkQUIC(ctx, target.Host, testIPs, opts.Timeout)
+		quicLayer = r.checkQUIC(ctx, target.Host, testIPs)
 		d.Layers = append(d.Layers, quicLayer)
 		emitEvent(emit, Event{Kind: EventLayerResult, Target: target, Layer: quicLayer})
 	}
@@ -215,11 +232,11 @@ func ParseTarget(raw string) (Target, error) {
 		path = "/"
 	}
 	return Target{
-		Raw: raw, Scheme: u.Scheme, Host: normalizeHost(host), Port: port, Path: path, ExplicitURL: explicit,
+		Raw: raw, Scheme: u.Scheme, Host: netutil.NormalizeHost(host), Port: port, Path: path, ExplicitURL: explicit,
 	}, nil
 }
 
-func checkDNS(ctx context.Context, host string, timeout time.Duration) (LayerResult, []string, []string) {
+func (r *runner) checkDNS(ctx context.Context, host string) (LayerResult, []string, []string) {
 	layer := LayerResult{Name: "DNS", Status: "ok", Confidence: 40}
 	var systemIPs, controlIPs []string
 	var mu sync.Mutex
@@ -230,7 +247,7 @@ func checkDNS(ctx context.Context, host string, timeout time.Duration) (LayerRes
 		go func() {
 			defer wg.Done()
 			start := time.Now()
-			rctx, cancel := context.WithTimeout(ctx, timeout)
+			rctx, cancel := context.WithTimeout(ctx, r.timeout)
 			ips, err := net.DefaultResolver.LookupIP(rctx, "ip", host)
 			cancel()
 			at := Attempt{Target: "system resolver", Latency: time.Since(start)}
@@ -253,7 +270,7 @@ func checkDNS(ctx context.Context, host string, timeout time.Duration) (LayerRes
 		wg.Add(1)
 		go func(resolver string) {
 			defer wg.Done()
-			ips, attempts := queryResolverBoth(ctx, resolver, host, timeout)
+			ips, attempts := queryResolverBoth(ctx, resolver, host, r.timeout)
 			mu.Lock()
 			controlIPs = append(controlIPs, ips...)
 			layer.Attempts = append(layer.Attempts, attempts...)
@@ -264,7 +281,7 @@ func checkDNS(ctx context.Context, host string, timeout time.Duration) (LayerRes
 		wg.Add(1)
 		go func(endpoint string) {
 			defer wg.Done()
-			ips, attempts := queryDoHBoth(ctx, endpoint, host, timeout)
+			ips, attempts := r.queryDoHBoth(ctx, endpoint, host)
 			mu.Lock()
 			controlIPs = append(controlIPs, ips...)
 			layer.Attempts = append(layer.Attempts, attempts...)
@@ -297,7 +314,7 @@ func checkDNS(ctx context.Context, host string, timeout time.Duration) (LayerRes
 	return layer, systemIPs, controlIPs
 }
 
-func checkTCP(ctx context.Context, ips []string, port string, timeout time.Duration) LayerResult {
+func (r *runner) checkTCP(ctx context.Context, ips []string, port string) LayerResult {
 	layer := LayerResult{Name: "TCP", Status: "fail", Confidence: 60}
 	successes := 0
 	var mu sync.Mutex
@@ -308,8 +325,8 @@ func checkTCP(ctx context.Context, ips []string, port string, timeout time.Durat
 			go func(ip string) {
 				defer wg.Done()
 				start := time.Now()
-				d := net.Dialer{Timeout: timeout}
-				cctx, cancel := context.WithTimeout(ctx, timeout)
+				d := net.Dialer{Timeout: r.timeout}
+				cctx, cancel := context.WithTimeout(ctx, r.timeout)
 				conn, err := d.DialContext(cctx, "tcp", net.JoinHostPort(ip, port))
 				cancel()
 				at := Attempt{Target: net.JoinHostPort(ip, port), Latency: time.Since(start)}
@@ -339,7 +356,7 @@ func checkTCP(ctx context.Context, ips []string, port string, timeout time.Durat
 	return layer
 }
 
-func checkTLS(ctx context.Context, host string, ips []string, port string, timeout time.Duration) LayerResult {
+func (r *runner) checkTLS(ctx context.Context, host string, ips []string, port string) LayerResult {
 	layer := LayerResult{Name: "TLS/SNI", Status: "fail", Confidence: 60}
 	normalOK, noSNIOK, wrongSNIOK := 0, 0, 0
 	var mu sync.Mutex
@@ -362,7 +379,7 @@ func checkTLS(ctx context.Context, host string, ips []string, port string, timeo
 				wg.Add(1)
 				go func(ip, label, sni, kind string) {
 					defer wg.Done()
-					at := tlsAttempt(ctx, label, ip, port, sni, timeout)
+					at := r.tlsAttempt(ctx, label, ip, port, sni)
 					mu.Lock()
 					if at.OK {
 						switch kind {
@@ -396,11 +413,11 @@ func checkTLS(ctx context.Context, host string, ips []string, port string, timeo
 	return layer
 }
 
-func tlsAttempt(ctx context.Context, label, ip, port, sni string, timeout time.Duration) Attempt {
+func (r *runner) tlsAttempt(ctx context.Context, label, ip, port, sni string) Attempt {
 	start := time.Now()
-	dialer := &net.Dialer{Timeout: timeout}
+	dialer := &net.Dialer{Timeout: r.timeout}
 	conf := &tls.Config{InsecureSkipVerify: true, ServerName: sni, NextProtos: []string{"h2", "http/1.1"}}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
+	cctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 	td := tls.Dialer{NetDialer: dialer, Config: conf}
 	conn, err := td.DialContext(cctx, "tcp", net.JoinHostPort(ip, port))
@@ -416,7 +433,7 @@ func tlsAttempt(ctx context.Context, label, ip, port, sni string, timeout time.D
 	return at
 }
 
-func checkHTTP(ctx context.Context, target Target, ips []string, timeout time.Duration) LayerResult {
+func (r *runner) checkHTTP(ctx context.Context, target Target, ips []string) LayerResult {
 	layer := LayerResult{Name: "HTTP", Status: "fail", Confidence: 60}
 	normalOK, hostControlOK := 0, 0
 	var mu sync.Mutex
@@ -426,7 +443,7 @@ func checkHTTP(ctx context.Context, target Target, ips []string, timeout time.Du
 			wg.Add(1)
 			go func(ip string) {
 				defer wg.Done()
-				at := httpAttempt(ctx, target, ip, target.Host, timeout)
+				at := r.httpAttempt(ctx, target, ip, target.Host)
 				mu.Lock()
 				if at.OK {
 					normalOK++
@@ -444,7 +461,7 @@ func checkHTTP(ctx context.Context, target Target, ips []string, timeout time.Du
 				wg.Add(1)
 				go func(ip, wrongHost string) {
 					defer wg.Done()
-					at := httpAttempt(ctx, target, ip, wrongHost, timeout)
+					at := r.httpAttempt(ctx, target, ip, wrongHost)
 					at.Target = "Host=" + wrongHost + " -> " + at.Target
 					mu.Lock()
 					if at.OK {
@@ -472,9 +489,9 @@ func checkHTTP(ctx context.Context, target Target, ips []string, timeout time.Du
 	return layer
 }
 
-func httpAttempt(ctx context.Context, target Target, ip, hostHeader string, timeout time.Duration) Attempt {
+func (r *runner) httpAttempt(ctx context.Context, target Target, ip, hostHeader string) Attempt {
 	start := time.Now()
-	cctx, cancel := context.WithTimeout(ctx, timeout)
+	cctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
 	tr := &http.Transport{
@@ -484,16 +501,16 @@ func httpAttempt(ctx context.Context, target Target, ip, hostHeader string, time
 			ServerName:         target.Host,
 		},
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			d := net.Dialer{Timeout: timeout}
+			d := net.Dialer{Timeout: r.timeout}
 			return d.DialContext(ctx, network, net.JoinHostPort(ip, target.Port))
 		},
 	}
 	defer tr.CloseIdleConnections()
-	client := &http.Client{Transport: tr, Timeout: timeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	client := &http.Client{Transport: tr, Timeout: r.timeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}
 
-	u := target.Scheme + "://" + hostForURL(target.Host)
+	u := target.Scheme + "://" + netutil.HostForHTTP(target.Host)
 	if (target.Scheme == "http" && target.Port != "80") || (target.Scheme == "https" && target.Port != "443") {
 		u += ":" + target.Port
 	}
@@ -516,7 +533,7 @@ func httpAttempt(ctx context.Context, target Target, ip, hostHeader string, time
 	return at
 }
 
-func checkQUIC(ctx context.Context, host string, ips []string, timeout time.Duration) LayerResult {
+func (r *runner) checkQUIC(ctx context.Context, host string, ips []string) LayerResult {
 	layer := LayerResult{Name: "HTTP/3 QUIC/SNI", Status: "fail", Confidence: 50}
 	normalOK, controlOK := 0, 0
 	var mu sync.Mutex
@@ -538,7 +555,7 @@ func checkQUIC(ctx context.Context, host string, ips []string, timeout time.Dura
 				wg.Add(1)
 				go func(ip, label, sni, kind string) {
 					defer wg.Done()
-					at := quicAttempt(ctx, label, ip, sni, timeout)
+					at := r.quicAttempt(ctx, label, ip, sni)
 					mu.Lock()
 					if at.OK {
 						if kind == "normal" {
@@ -555,7 +572,7 @@ func checkQUIC(ctx context.Context, host string, ips []string, timeout time.Dura
 		wg.Add(1)
 		go func(ip string) {
 			defer wg.Done()
-			at := randomUDPProbe(ctx, ip, timeout)
+			at := r.randomUDPProbe(ctx, ip)
 			mu.Lock()
 			layer.Attempts = append(layer.Attempts, at)
 			mu.Unlock()
@@ -576,15 +593,15 @@ func checkQUIC(ctx context.Context, host string, ips []string, timeout time.Dura
 	return layer
 }
 
-func quicAttempt(ctx context.Context, label, ip, sni string, timeout time.Duration) Attempt {
+func (r *runner) quicAttempt(ctx context.Context, label, ip, sni string) Attempt {
 	start := time.Now()
-	cctx, cancel := context.WithTimeout(ctx, timeout)
+	cctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 	conn, err := quic.DialAddr(cctx, net.JoinHostPort(ip, "443"), &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         sni,
 		NextProtos:         []string{"h3"},
-	}, &quic.Config{MaxIdleTimeout: timeout})
+	}, &quic.Config{MaxIdleTimeout: r.timeout})
 	at := Attempt{Target: label + " -> " + net.JoinHostPort(ip, "443"), Latency: time.Since(start)}
 	if err != nil {
 		at.Err = classifyNetErr(err)
@@ -596,10 +613,10 @@ func quicAttempt(ctx context.Context, label, ip, sni string, timeout time.Durati
 	return at
 }
 
-func randomUDPProbe(ctx context.Context, ip string, timeout time.Duration) Attempt {
+func (r *runner) randomUDPProbe(ctx context.Context, ip string) Attempt {
 	start := time.Now()
-	d := net.Dialer{Timeout: timeout}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
+	d := net.Dialer{Timeout: r.timeout}
+	cctx, cancel := context.WithTimeout(ctx, r.timeout)
 	conn, err := d.DialContext(cctx, "udp", net.JoinHostPort(ip, "443"))
 	cancel()
 	at := Attempt{Target: "random UDP -> " + net.JoinHostPort(ip, "443"), Latency: time.Since(start)}
@@ -608,7 +625,7 @@ func randomUDPProbe(ctx context.Context, ip string, timeout time.Duration) Attem
 		return at
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(timeout))
+	conn.SetDeadline(time.Now().Add(r.timeout))
 	conn.Write([]byte("IPORT-G-UDP-CONTROL"))
 	buf := make([]byte, 64)
 	_, err = conn.Read(buf)
@@ -742,18 +759,18 @@ func queryDNS(ctx context.Context, network, resolver, host string, qtype dnsmess
 	return ips, at
 }
 
-func queryDoHBoth(ctx context.Context, endpoint, host string, timeout time.Duration) ([]string, []Attempt) {
+func (r *runner) queryDoHBoth(ctx context.Context, endpoint, host string) ([]string, []Attempt) {
 	var ips []string
 	var attempts []Attempt
 	for _, qtype := range []dnsmessage.Type{dnsmessage.TypeA, dnsmessage.TypeAAAA} {
-		got, at := queryDoH(ctx, endpoint, host, qtype, timeout)
+		got, at := r.queryDoH(ctx, endpoint, host, qtype)
 		ips = append(ips, got...)
 		attempts = append(attempts, at)
 	}
 	return uniqueSorted(ips), attempts
 }
 
-func queryDoH(ctx context.Context, endpoint, host string, qtype dnsmessage.Type, timeout time.Duration) ([]string, Attempt) {
+func (r *runner) queryDoH(ctx context.Context, endpoint, host string, qtype dnsmessage.Type) ([]string, Attempt) {
 	start := time.Now()
 	msg, err := dnsQueryMessage(host, qtype)
 	at := Attempt{Target: fmt.Sprintf("DoH %s %s", endpoint, qtype)}
@@ -761,7 +778,7 @@ func queryDoH(ctx context.Context, endpoint, host string, qtype dnsmessage.Type,
 		at.Err = err.Error()
 		return nil, at
 	}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
+	cctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, "POST", endpoint, bytes.NewReader(msg))
 	if err != nil {
@@ -770,8 +787,7 @@ func queryDoH(ctx context.Context, endpoint, host string, qtype dnsmessage.Type,
 	}
 	req.Header.Set("Accept", "application/dns-message")
 	req.Header.Set("Content-Type", "application/dns-message")
-	client := &http.Client{Timeout: timeout}
-	resp, err := client.Do(req)
+	resp, err := r.dohClient.Do(req)
 	at.Latency = time.Since(start)
 	if err != nil {
 		at.Err = classifyNetErr(err)
@@ -920,26 +936,6 @@ func hasBogon(ips []string) bool {
 		}
 	}
 	return false
-}
-
-func normalizeHost(host string) string {
-	if len(host) > 2 && host[0] == '[' && host[len(host)-1] == ']' {
-		host = host[1 : len(host)-1]
-	}
-	if i := strings.Index(host, "%25"); i != -1 {
-		host = host[:i]
-	}
-	if i := strings.Index(host, "%"); i != -1 {
-		host = host[:i]
-	}
-	return host
-}
-
-func hostForURL(host string) string {
-	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
-		return "[" + host + "]"
-	}
-	return host
 }
 
 func sha256Bytes(b []byte) []byte {
