@@ -11,7 +11,7 @@ Point `iport` at any target and it concurrently checks L3/L4 connectivity, TLS p
 - **HTTP Protocol Detection** -- Negotiates HTTP/1.1 and HTTP/2 via ALPN; checks HTTP/3 (QUIC) over UDP.
 - **Proxy Protocol Detection** -- Actively probes open ports for 25 proxy/tunnel protocols with confidence scoring and transport layer identification.
 - **Website Connectivity Diagnosis** -- `-G` performs layered checks (DNS, TCP, TLS/SNI, HTTP, QUIC) to identify the root cause of access failures, including GFW-style blocking signals.
-- **DNS Pin-Once Architecture** -- Resolves DNS once and pins the IP for all subsequent operations, ensuring consistent results.
+- **DNS Pin-Once Architecture** -- Resolves DNS once and pins the IP for all subsequent operations, ensuring that ICMP ping, TCP/UDP scans, TLS handshakes, and proxy probes all target the same endpoint. Prevents scenarios where DNS round-robin causes inconsistent results across layers.
 - **Static Binary** -- Single Go binary with no external dependencies.
 
 ## Installation
@@ -54,6 +54,57 @@ iport -list-probes
 iport example.com -A -timeout 5000 -c 2000
 ```
 
+## Performance & Tuning
+
+### Choosing Concurrency (`-c`)
+
+The `-c` flag controls the global semaphore that limits concurrent network operations:
+
+| Scenario | Recommended `-c` | Rationale |
+|----------|-----------------|-----------|
+| Single host, few ports | 100-500 | Avoid overwhelming the target or local network stack |
+| Single host, all ports (`-A`) | 1000-2000 | Balance speed against SYN flood detection |
+| Local network scan | 2000+ | LAN can handle higher concurrency |
+| Unstable / high-latency link | 100-300 | Reduce packet loss and retransmissions |
+
+**Too high** (`>5000`): May trigger SYN flood protection, cause "too many open files" errors, or saturate the local network interface.
+
+**Too low** (`<100`): Scan becomes unnecessarily slow; most time is spent waiting.
+
+### Choosing Timeout (`-timeout`)
+
+Default is 2000ms. Adjust based on target distance and network conditions:
+
+| Target Location | Recommended Timeout |
+|----------------|-------------------|
+| Same datacenter | 500-1000ms |
+| Same continent | 1500-2500ms |
+| Cross-continent | 3000-5000ms |
+| High-latency satellite | 5000-10000ms |
+
+Proxy detection uses `3 * timeout` as a total per-port budget since multiple probes run sequentially.
+
+### Speed vs. Accuracy Trade-offs
+
+| Goal | Flags | Expected Speed |
+|------|-------|---------------|
+| Fastest port scan | `-probe=false -T` | ~1s for 2 ports |
+| Standard scan | defaults | ~3-5s for 2 ports |
+| Full port scan | `-A` | ~2-5min for 65535 ports |
+| Thorough proxy detection | `-probe-only -p 443,1080` | ~10-20s per port |
+
+### File Descriptor Limits
+
+High concurrency may exhaust the OS file descriptor limit:
+
+```bash
+# Check current limit
+ulimit -n
+
+# Temporarily increase (Linux/macOS)
+ulimit -n 4096
+```
+
 ## Flags
 
 | Flag | Default | Description |
@@ -88,6 +139,8 @@ iport example.com -A -timeout 5000 -c 2000
 | Other | Snell, obfs4 (Tor), Brook, mKCP | Protocol-specific probes |
 
 Confidence levels: High (>=80%) / Medium (40-79%) / Low (<40%)
+
+See [PROBING.md](PROBING.md) for a deep dive into detection methodology, confidence scoring, and false positive/negative analysis.
 
 ## Website Diagnosis (`-G`)
 
@@ -150,3 +203,45 @@ internal/ui/print.go        Terminal output formatting
 internal/netutil/host.go    Shared host/URL utilities
 internal/webcheck/          Website connectivity diagnosis engine
 ```
+
+## Security Considerations
+
+### TLS Certificate Verification
+
+`iport` uses `InsecureSkipVerify: true` in TLS probes and the `-G` diagnosis mode. This is intentional: the tool analyzes TLS handshakes to detect protocol characteristics and censorship, which requires connecting even when certificates are invalid or SNI-filtered.
+
+**Implications:**
+- You are susceptible to Man-in-the-Middle attacks during scans
+- Do not use `iport` to verify the security of a TLS endpoint
+- The tool is designed for network analysis, not security auditing
+
+**Mitigation:** If you need both protocol detection and certificate validation, run a separate `openssl s_client` or `curl` check after scanning.
+
+### Scanning Ethics
+
+- **Only scan hosts you own or have explicit permission to test**
+- High concurrency (`-c >2000`) may resemble a SYN flood attack
+- Some networks auto-ban IPs that perform port scans
+- The proxy probes send actual protocol handshakes — they are not passive
+
+### Data Privacy
+
+- `iport` does not collect or transmit scan data externally
+- DNS queries are sent to public resolvers (1.1.1.1, 8.8.8.8, 223.5.5.5) in `-G` mode
+- No logs are written to disk unless redirected via shell
+
+## Contributing
+
+Want to add a new protocol probe or improve detection accuracy? See [CONTRIBUTING.md](CONTRIBUTING.md) for:
+
+- Step-by-step guide to adding probes
+- Confidence calibration guidelines
+- Code conventions and testing requirements
+
+## Troubleshooting
+
+Common issues and solutions: [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
+
+---
+
+*For detailed detection methodology: [PROBING.md](PROBING.md)*
