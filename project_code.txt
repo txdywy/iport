@@ -1,0 +1,686 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/txdywy/iport/internal/scanner"
+	"github.com/txdywy/iport/internal/ui"
+)
+
+var (
+	Version = "dev"
+)
+
+func main() {
+	// Workaround for Go's flag package stopping on the first non-flag argument.
+	if len(os.Args) > 2 && !strings.HasPrefix(os.Args[1], "-") {
+		arg := os.Args[1]
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		os.Args = append(os.Args, arg)
+	}
+
+	var target string
+	var ports string
+	var timeoutMs int
+	var showVersion bool
+	var allPorts bool
+	var concurrency int
+	var probeProxy bool
+	var probeOnly bool
+	var listProbes bool
+
+	flag.StringVar(&target, "t", "", "Target IP or domain (e.g., example.com, 192.168.1.1)")
+	flag.StringVar(&ports, "p", "", "Ports to scan (comma separated). If not provided, defaults to 80,443")
+	flag.IntVar(&timeoutMs, "timeout", 2000, "Timeout in milliseconds for each probe")
+	flag.BoolVar(&showVersion, "V", false, "Show version and exit")
+	flag.BoolVar(&allPorts, "A", false, "Scan all 65535 TCP ports")
+	flag.IntVar(&concurrency, "c", 1000, "Maximum concurrent port scans")
+	flag.BoolVar(&probeProxy, "probe", true, "Enable proxy protocol detection on open ports")
+	flag.BoolVar(&probeOnly, "probe-only", false, "Skip TLS/HTTP detection, only run proxy protocol probes")
+	flag.BoolVar(&listProbes, "list-probes", false, "List all supported proxy protocol probes and exit")
+	flag.Parse()
+
+	if showVersion {
+		fmt.Printf("iport version %s\n", Version)
+		os.Exit(0)
+	}
+
+	if listProbes {
+		ui.PrintProbeList(scanner.ListAllProbes())
+		os.Exit(0)
+	}
+
+	if target == "" {
+		if args := flag.Args(); len(args) > 0 {
+			target = args[0]
+		}
+	}
+
+	if target == "" {
+		fmt.Println("Usage: iport <target> [options]")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	var portList []string
+	if allPorts {
+		portList = make([]string, 65535)
+		for i := range portList {
+			portList[i] = strconv.Itoa(i + 1)
+		}
+		if !probeOnly {
+			probeProxy = false // disable probe for full port scan by default
+		}
+	} else {
+		if ports == "" {
+			ports = "80,443"
+		}
+		portList = strings.Split(ports, ",")
+		for i := range portList {
+			portList[i] = strings.TrimSpace(portList[i])
+		}
+	}
+
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+	bigScan := len(portList) > 100
+
+	ui.PrintHeader(target)
+
+	// Phase 1: Basic Connectivity
+	ui.PrintSection("L3/L4 Basic Connectivity")
+
+	var wg sync.WaitGroup
+
+	// ICMP
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		rtt, err := scanner.Ping(target, timeout)
+		ui.PrintResult("ICMP Ping", err, fmt.Sprintf("RTT: %v", rtt))
+	}()
+
+	// TCP/UDP port scanning with worker pool
+	var openTCPPorts []string
+	var openUDPPorts []string
+	var openPortsMu sync.Mutex
+
+	type portJob struct{ port string }
+	jobs := make(chan portJob, concurrency)
+
+	var scannedPorts int32
+	var doneCh chan struct{}
+
+	if bigScan {
+		doneCh = make(chan struct{})
+		go func() {
+			total := len(portList)
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					p := atomic.LoadInt32(&scannedPorts)
+					ui.PrintProgress(total, int(p))
+				case <-doneCh:
+					ui.ClearProgress()
+					return
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				port := job.port
+				err := scanner.CheckTCP(target, port, timeout)
+				if err == nil {
+					openPortsMu.Lock()
+					openTCPPorts = append(openTCPPorts, port)
+					openPortsMu.Unlock()
+					if bigScan {
+						ui.ClearProgress()
+					}
+					ui.PrintResult(fmt.Sprintf("TCP Port %s", port), nil, "Open")
+				} else if !bigScan {
+					ui.PrintResult(fmt.Sprintf("TCP Port %s", port), err, "")
+				}
+
+				if !allPorts {
+					udpErr := scanner.CheckUDP(target, port, timeout)
+					if udpErr != nil && strings.Contains(udpErr.Error(), "timeout") {
+						openPortsMu.Lock()
+						openUDPPorts = append(openUDPPorts, port)
+						openPortsMu.Unlock()
+						if !bigScan {
+							ui.PrintResult(fmt.Sprintf("UDP Port %s", port), fmt.Errorf("timeout (open|filtered)"), "")
+						}
+					} else if udpErr == nil {
+						openPortsMu.Lock()
+						openUDPPorts = append(openUDPPorts, port)
+						openPortsMu.Unlock()
+						if bigScan {
+							ui.ClearProgress()
+						}
+						ui.PrintResult(fmt.Sprintf("UDP Port %s", port), nil, "Open")
+					} else if !bigScan {
+						ui.PrintResult(fmt.Sprintf("UDP Port %s", port), udpErr, "")
+					}
+				}
+
+				atomic.AddInt32(&scannedPorts, 1)
+			}
+		}()
+	}
+
+	for _, p := range portList {
+		jobs <- portJob{port: p}
+	}
+	close(jobs)
+
+	wg.Wait()
+	if doneCh != nil {
+		close(doneCh)
+	}
+
+	sort.Strings(openTCPPorts)
+	sort.Strings(openUDPPorts)
+
+	// Phase 2 & 3: TLS Detection and Application Layer (skip if -probe-only)
+	if !probeOnly {
+		for _, port := range openTCPPorts {
+			ui.PrintSection(fmt.Sprintf("TLS Detection (Port %s)", port))
+			tlsVersions := []uint16{
+				scanner.VersionTLS10,
+				scanner.VersionTLS11,
+				scanner.VersionTLS12,
+				scanner.VersionTLS13,
+			}
+
+			for _, v := range tlsVersions {
+				wg.Add(1)
+				go func(version uint16, port string) {
+					defer wg.Done()
+					cipher, err := scanner.CheckTLS(target, port, version, timeout)
+					name := scanner.TLSVersionName(version)
+					if err == nil {
+						ui.PrintResult(fmt.Sprintf("TLS %s", name), nil, fmt.Sprintf("Supported (Cipher: %s)", cipher))
+					} else {
+						ui.PrintResult(fmt.Sprintf("TLS %s", name), err, "")
+					}
+				}(v, port)
+			}
+			wg.Wait()
+
+			ui.PrintSection(fmt.Sprintf("Application Layer (L7) (Port %s)", port))
+
+			wg.Add(1)
+			go func(port string) {
+				defer wg.Done()
+				proto, err := scanner.CheckHTTP(target, port, timeout)
+				if err == nil {
+					ui.PrintResult("HTTP (over TCP)", nil, fmt.Sprintf("Negotiated: %s", proto))
+				} else {
+					ui.PrintResult("HTTP (over TCP)", err, "")
+				}
+			}(port)
+
+			wg.Add(1)
+			go func(port string) {
+				defer wg.Done()
+				err := scanner.CheckHTTP3(target, port, timeout)
+				if err == nil {
+					ui.PrintResult("HTTP/3 (QUIC/UDP)", nil, "Supported")
+				} else {
+					ui.PrintResult("HTTP/3 (QUIC/UDP)", err, "")
+				}
+			}(port)
+
+			wg.Wait()
+		}
+	}
+
+	// Phase 4: Proxy Protocol Detection
+	if probeProxy || probeOnly {
+		allProxyResults := make(map[string][]ui.ProbeDisplay)
+
+		// TCP probes on open TCP ports
+		for _, port := range openTCPPorts {
+			ui.PrintSection(fmt.Sprintf("Proxy Protocol Detection (TCP Port %s)", port))
+			results := scanner.RunTCPProbes(target, port, timeout)
+			displays := toDisplays(results)
+			ui.PrintProxyResults(port, displays)
+			if len(displays) > 0 {
+				allProxyResults[port] = displays
+			}
+		}
+
+		// UDP probes on open/filtered UDP ports
+		for _, port := range openUDPPorts {
+			ui.PrintSection(fmt.Sprintf("Proxy Protocol Detection (UDP Port %s)", port))
+			results := scanner.RunUDPProbes(target, port, timeout)
+			displays := toDisplays(results)
+			ui.PrintProxyResults(port, displays)
+			if len(displays) > 0 {
+				allProxyResults["udp/"+port] = displays
+			}
+		}
+
+		// Summary
+		ui.PrintProxySummary(allProxyResults)
+	}
+
+	fmt.Println()
+}
+
+func toDisplays(results []scanner.ProbeResult) []ui.ProbeDisplay {
+	out := make([]ui.ProbeDisplay, len(results))
+	for i, r := range results {
+		out[i] = ui.ProbeDisplay{
+			Protocol:   r.Protocol,
+			Transport:  r.Transport,
+			Confidence: r.Confidence,
+		}
+	}
+	return out
+}
+package scanner
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/quic-go/quic-go"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+)
+
+const (
+	VersionTLS10 = tls.VersionTLS10
+	VersionTLS11 = tls.VersionTLS11
+	VersionTLS12 = tls.VersionTLS12
+	VersionTLS13 = tls.VersionTLS13
+)
+
+func TLSVersionName(v uint16) string {
+	switch v {
+	case tls.VersionTLS10:
+		return "1.0"
+	case tls.VersionTLS11:
+		return "1.1"
+	case tls.VersionTLS12:
+		return "1.2"
+	case tls.VersionTLS13:
+		return "1.3"
+	default:
+		return "Unknown"
+	}
+}
+
+// CheckTCP attempts to connect to a TCP port
+func CheckTCP(host string, port string, timeout time.Duration) error {
+	target := net.JoinHostPort(host, port)
+	conn, err := net.DialTimeout("tcp", target, timeout)
+	if err != nil {
+		return err
+	}
+	conn.Close()
+	return nil
+}
+
+// CheckUDP attempts to send a packet to a UDP port and waits for an ICMP unreachable.
+// Note: This is a basic UDP check. Many firewalls silently drop UDP packets.
+func CheckUDP(host string, port string, timeout time.Duration) error {
+	target := net.JoinHostPort(host, port)
+	conn, err := net.DialTimeout("udp", target, timeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Send a single-byte packet (empty write may be a no-op on some systems)
+	if _, err = conn.Write([]byte{0}); err != nil {
+		return err
+	}
+
+	conn.SetReadDeadline(time.Now().Add(timeout))
+
+	buffer := make([]byte, 1024)
+	_, err = conn.Read(buffer)
+	if err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return fmt.Errorf("timeout (open|filtered)")
+		}
+		return err
+	}
+	return nil
+}
+
+// Ping sends an ICMP Echo Request
+func Ping(host string, timeout time.Duration) (time.Duration, error) {
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return 0, err
+	}
+
+	var ip net.IP
+	for _, i := range ips {
+		if i.To4() != nil {
+			ip = i
+			break
+		}
+	}
+	if ip == nil {
+		return 0, fmt.Errorf("no IPv4 address found")
+	}
+
+	c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	if err != nil {
+		return 0, fmt.Errorf("icmp listen requires root privileges")
+	}
+	defer c.Close()
+
+	wm := icmp.Message{
+		Type: ipv4.ICMPTypeEcho, Code: 0,
+		Body: &icmp.Echo{
+			ID: os.Getpid() & 0xffff, Seq: 1,
+			Data: []byte("HELLO-IPORT"),
+		},
+	}
+	wb, err := wm.Marshal(nil)
+	if err != nil {
+		return 0, err
+	}
+
+	start := time.Now()
+	if _, err := c.WriteTo(wb, &net.IPAddr{IP: ip}); err != nil {
+		return 0, err
+	}
+
+	c.SetReadDeadline(time.Now().Add(timeout))
+	rb := make([]byte, 1500)
+	n, _, err := c.ReadFrom(rb)
+	if err != nil {
+		return 0, fmt.Errorf("timeout")
+	}
+	rtt := time.Since(start)
+
+	rm, err := icmp.ParseMessage(ipv4.ICMPTypeEchoReply.Protocol(), rb[:n])
+	if err != nil {
+		return 0, err
+	}
+	if rm.Type == ipv4.ICMPTypeEchoReply {
+		return rtt, nil
+	}
+	return 0, fmt.Errorf("unexpected ICMP type: %v", rm.Type)
+}
+
+// CheckTLS checks if a specific TLS version is supported
+func CheckTLS(host string, port string, version uint16, timeout time.Duration) (string, error) {
+	target := net.JoinHostPort(host, port)
+
+	conf := &tls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         version,
+		MaxVersion:         version,
+		ServerName:         host,
+	}
+
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", target, conf)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	state := conn.ConnectionState()
+	return tls.CipherSuiteName(state.CipherSuite), nil
+}
+
+// CheckHTTP checks standard HTTP/HTTPS and ALPN negotiation
+func CheckHTTP(host string, port string, timeout time.Duration) (string, error) {
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	defer tr.CloseIdleConnections()
+
+	client := &http.Client{Timeout: timeout, Transport: tr}
+
+	// Determine scheme based on port
+	scheme := "https"
+	if port == "80" {
+		scheme = "http"
+	}
+
+	urlHost := host
+	if port != "80" && port != "443" {
+		urlHost = net.JoinHostPort(host, port)
+	}
+
+	resp, err := client.Get(scheme + "://" + urlHost)
+	if err != nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		// Fallback: try the other scheme for non-standard ports
+		if port != "80" && port != "443" {
+			alt := "http"
+			if scheme == "http" {
+				alt = "https"
+			}
+			resp, err = client.Get(alt + "://" + urlHost)
+			if err != nil {
+				if resp != nil {
+					resp.Body.Close()
+				}
+				return "", err
+			}
+		} else {
+			return "", err
+		}
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	proto := resp.Proto
+	if resp.TLS != nil && resp.TLS.NegotiatedProtocol != "" {
+		proto = resp.TLS.NegotiatedProtocol
+	}
+
+	return fmt.Sprintf("%s (Status: %d)", proto, resp.StatusCode), nil
+}
+
+// CheckHTTP3 checks QUIC / HTTP3 support
+func CheckHTTP3(host string, port string, timeout time.Duration) error {
+	target := net.JoinHostPort(host, port)
+
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	conn, err := quic.DialAddr(ctx, target, tlsConf, &quic.Config{})
+	if err != nil {
+		return err
+	}
+	defer conn.CloseWithError(0, "")
+	return nil
+}
+package ui
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/fatih/color"
+)
+
+var (
+	mu           sync.Mutex
+	successColor = color.New(color.FgGreen).SprintFunc()
+	infoColor    = color.New(color.FgCyan).SprintFunc()
+	warnColor    = color.New(color.FgYellow).SprintFunc()
+	errorColor   = color.New(color.FgRed).SprintFunc()
+	bold         = color.New(color.Bold).SprintFunc()
+	dimColor     = color.New(color.Faint).SprintFunc()
+)
+
+func PrintHeader(target string) {
+	mu.Lock()
+	defer mu.Unlock()
+	fmt.Printf("\n🎯 %s: %s\n\n", bold("Target"), infoColor(target))
+}
+
+func PrintSection(title string) {
+	mu.Lock()
+	defer mu.Unlock()
+	fmt.Printf("%s\n", bold("["+title+"]"))
+}
+
+func PrintResult(name string, err error, extra string) {
+	mu.Lock()
+	defer mu.Unlock()
+	if err == nil {
+		fmt.Printf(" %s %s: %s\n", successColor("🟢"), name, infoColor(extra))
+	} else {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "unsupported") || strings.Contains(errMsg, "protocol error") || strings.Contains(errMsg, "handshake failure") {
+			if strings.Contains(strings.ToLower(name), "tls 1.0") || strings.Contains(strings.ToLower(name), "tls 1.1") {
+				fmt.Printf(" %s %s: %s (Secure)\n", successColor("🟢"), name, "Not Supported")
+			} else {
+				fmt.Printf(" %s %s: %s\n", warnColor("🟡"), name, warnColor(errMsg))
+			}
+		} else {
+			fmt.Printf(" %s %s: %s\n", errorColor("🔴"), name, errorColor(errMsg))
+		}
+	}
+}
+
+func PrintProgress(total, done int) {
+	mu.Lock()
+	defer mu.Unlock()
+	fmt.Printf("\r\033[K⏳ Scanning %d ports: [%d/%d] (%.1f%%)", total, done, total, float64(done)*100/float64(total))
+}
+
+func ClearProgress() {
+	mu.Lock()
+	defer mu.Unlock()
+	fmt.Printf("\r\033[K")
+}
+
+// ProbeDisplay is a simplified view of a probe result for the UI layer.
+type ProbeDisplay struct {
+	Protocol   string
+	Transport  string
+	Confidence float64
+}
+
+// PrintProxyResults prints detected proxy protocols for a port, color-coded by confidence.
+func PrintProxyResults(port string, results []ProbeDisplay) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(results) == 0 {
+		fmt.Printf(" %s No proxy protocols detected\n", dimColor("⚪"))
+		return
+	}
+
+	// Sort by confidence descending
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Confidence > results[j].Confidence
+	})
+
+	for _, r := range results {
+		label := r.Protocol
+		if r.Transport != "" {
+			label += " over " + r.Transport
+		}
+		conf := fmt.Sprintf("%.0f%%", r.Confidence)
+
+		if r.Confidence >= 80 {
+			fmt.Printf(" %s %s %s\n", successColor("🟢"), label, successColor(conf))
+		} else if r.Confidence >= 40 {
+			fmt.Printf(" %s %s %s\n", warnColor("🟡"), label, warnColor(conf))
+		} else {
+			fmt.Printf(" %s %s %s\n", dimColor("⚪"), label, dimColor(conf))
+		}
+	}
+}
+
+// PrintProxySummary prints a final summary table of all detected proxy protocols across all ports.
+func PrintProxySummary(allResults map[string][]ProbeDisplay) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Collect ports with results
+	var ports []string
+	for port, results := range allResults {
+		if len(results) > 0 {
+			ports = append(ports, port)
+		}
+	}
+	if len(ports) == 0 {
+		return
+	}
+	sort.Strings(ports)
+
+	fmt.Printf("\n%s\n", bold("═══ Proxy Protocol Summary ═══"))
+	for _, port := range ports {
+		results := allResults[port]
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].Confidence > results[j].Confidence
+		})
+		for _, r := range results {
+			label := r.Protocol
+			if r.Transport != "" {
+				label += " over " + r.Transport
+			}
+			conf := fmt.Sprintf("%.0f%%", r.Confidence)
+
+			icon := dimColor("⚪")
+			colorFn := dimColor
+			if r.Confidence >= 80 {
+				icon = successColor("🟢")
+				colorFn = successColor
+			} else if r.Confidence >= 40 {
+				icon = warnColor("🟡")
+				colorFn = warnColor
+			}
+			fmt.Printf(" %s Port %-5s  %-35s %s\n", icon, port, label, colorFn(conf))
+		}
+	}
+	fmt.Println()
+}
+
+// PrintProbeList prints all supported probe protocols.
+func PrintProbeList(names []string) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	fmt.Printf("\n%s\n\n", bold("Supported Proxy Protocol Probes"))
+	for i, name := range names {
+		fmt.Printf("  %2d. %s\n", i+1, name)
+	}
+	fmt.Printf("\n  Total: %d protocols\n\n", len(names))
+}

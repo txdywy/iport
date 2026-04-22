@@ -15,9 +15,19 @@ import (
 	"github.com/txdywy/iport/internal/ui"
 )
 
-var (
-	Version = "dev"
-)
+var Version = "dev"
+
+// ScanResult is the decoupled result type — scanner produces, UI consumes.
+type ScanResult struct {
+	Kind       string // "section", "result", "proxy", "proxy-summary", "progress", "clear-progress"
+	Name       string
+	Err        error
+	Extra      string
+	Port       string
+	Probes     []ui.ProbeDisplay
+	AllProbes  map[string][]ui.ProbeDisplay
+	Total, Done int
+}
 
 func main() {
 	// Workaround for Go's flag package stopping on the first non-flag argument.
@@ -27,32 +37,33 @@ func main() {
 		os.Args = append(os.Args, arg)
 	}
 
-	var target string
-	var ports string
-	var timeoutMs int
-	var showVersion bool
-	var allPorts bool
-	var concurrency int
-	var probeProxy bool
-	var probeOnly bool
-	var listProbes bool
+	var (
+		target      string
+		ports       string
+		timeoutMs   int
+		showVersion bool
+		allPorts    bool
+		concurrency int
+		probeProxy  bool
+		probeOnly   bool
+		listProbes  bool
+	)
 
-	flag.StringVar(&target, "t", "", "Target IP or domain (e.g., example.com, 192.168.1.1)")
-	flag.StringVar(&ports, "p", "", "Ports to scan (comma separated). If not provided, defaults to 80,443")
-	flag.IntVar(&timeoutMs, "timeout", 2000, "Timeout in milliseconds for each probe")
+	flag.StringVar(&target, "t", "", "Target IP or domain")
+	flag.StringVar(&ports, "p", "", "Ports to scan (comma separated, default: 80,443)")
+	flag.IntVar(&timeoutMs, "timeout", 2000, "Timeout in milliseconds")
 	flag.BoolVar(&showVersion, "V", false, "Show version and exit")
 	flag.BoolVar(&allPorts, "A", false, "Scan all 65535 TCP ports")
-	flag.IntVar(&concurrency, "c", 1000, "Maximum concurrent port scans")
-	flag.BoolVar(&probeProxy, "probe", true, "Enable proxy protocol detection on open ports")
-	flag.BoolVar(&probeOnly, "probe-only", false, "Skip TLS/HTTP detection, only run proxy protocol probes")
-	flag.BoolVar(&listProbes, "list-probes", false, "List all supported proxy protocol probes and exit")
+	flag.IntVar(&concurrency, "c", 1000, "Maximum concurrent scans")
+	flag.BoolVar(&probeProxy, "probe", true, "Enable proxy protocol detection")
+	flag.BoolVar(&probeOnly, "probe-only", false, "Skip TLS/HTTP, only run proxy probes")
+	flag.BoolVar(&listProbes, "list-probes", false, "List supported protocols and exit")
 	flag.Parse()
 
 	if showVersion {
 		fmt.Printf("iport version %s\n", Version)
 		os.Exit(0)
 	}
-
 	if listProbes {
 		ui.PrintProbeList(scanner.ListAllProbes())
 		os.Exit(0)
@@ -63,12 +74,14 @@ func main() {
 			target = args[0]
 		}
 	}
-
 	if target == "" {
 		fmt.Println("Usage: iport <target> [options]")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
+
+	// Initialize global concurrency semaphore
+	scanner.SetSemaphore(concurrency)
 
 	var portList []string
 	if allPorts {
@@ -77,7 +90,7 @@ func main() {
 			portList[i] = strconv.Itoa(i + 1)
 		}
 		if !probeOnly {
-			probeProxy = false // disable probe for full port scan by default
+			probeProxy = false
 		}
 	} else {
 		if ports == "" {
@@ -92,10 +105,36 @@ func main() {
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	bigScan := len(portList) > 100
 
+	// --- Result channel: scanner goroutines produce, UI goroutine consumes ---
+	results := make(chan ScanResult, 256)
+	var uiDone sync.WaitGroup
+	uiDone.Add(1)
+	go func() {
+		defer uiDone.Done()
+		for r := range results {
+			switch r.Kind {
+			case "section":
+				ui.PrintSection(r.Name)
+			case "result":
+				ui.PrintResult(r.Name, r.Err, r.Extra)
+			case "proxy":
+				ui.PrintProxyResults(r.Port, r.Probes)
+			case "proxy-summary":
+				ui.PrintProxySummary(r.AllProbes)
+			case "progress":
+				ui.PrintProgress(r.Total, r.Done)
+			case "clear-progress":
+				ui.ClearProgress()
+			}
+		}
+	}()
+
+	emit := func(r ScanResult) { results <- r }
+
 	ui.PrintHeader(target)
 
-	// Phase 1: Basic Connectivity
-	ui.PrintSection("L3/L4 Basic Connectivity")
+	// ========== Phase 1: Basic Connectivity ==========
+	emit(ScanResult{Kind: "section", Name: "L3/L4 Basic Connectivity"})
 
 	var wg sync.WaitGroup
 
@@ -104,17 +143,15 @@ func main() {
 	go func() {
 		defer wg.Done()
 		rtt, err := scanner.Ping(target, timeout)
-		ui.PrintResult("ICMP Ping", err, fmt.Sprintf("RTT: %v", rtt))
+		emit(ScanResult{Kind: "result", Name: "ICMP Ping", Err: err, Extra: fmt.Sprintf("RTT: %v", rtt)})
 	}()
 
-	// TCP/UDP port scanning with worker pool
-	var openTCPPorts []string
-	var openUDPPorts []string
-	var openPortsMu sync.Mutex
+	// TCP/UDP port scanning
+	var openTCPPorts, openUDPPorts []string
+	var portsMu sync.Mutex
 
 	type portJob struct{ port string }
 	jobs := make(chan portJob, concurrency)
-
 	var scannedPorts int32
 	var doneCh chan struct{}
 
@@ -127,10 +164,9 @@ func main() {
 			for {
 				select {
 				case <-ticker.C:
-					p := atomic.LoadInt32(&scannedPorts)
-					ui.PrintProgress(total, int(p))
+					emit(ScanResult{Kind: "progress", Total: total, Done: int(atomic.LoadInt32(&scannedPorts))})
 				case <-doneCh:
-					ui.ClearProgress()
+					emit(ScanResult{Kind: "clear-progress"})
 					return
 				}
 			}
@@ -143,41 +179,39 @@ func main() {
 			defer wg.Done()
 			for job := range jobs {
 				port := job.port
-				err := scanner.CheckTCP(target, port, timeout)
-				if err == nil {
-					openPortsMu.Lock()
+				if err := scanner.CheckTCP(target, port, timeout); err == nil {
+					portsMu.Lock()
 					openTCPPorts = append(openTCPPorts, port)
-					openPortsMu.Unlock()
+					portsMu.Unlock()
 					if bigScan {
-						ui.ClearProgress()
+						emit(ScanResult{Kind: "clear-progress"})
 					}
-					ui.PrintResult(fmt.Sprintf("TCP Port %s", port), nil, "Open")
+					emit(ScanResult{Kind: "result", Name: fmt.Sprintf("TCP Port %s", port), Extra: "Open"})
 				} else if !bigScan {
-					ui.PrintResult(fmt.Sprintf("TCP Port %s", port), err, "")
+					emit(ScanResult{Kind: "result", Name: fmt.Sprintf("TCP Port %s", port), Err: err})
 				}
 
 				if !allPorts {
 					udpErr := scanner.CheckUDP(target, port, timeout)
 					if udpErr != nil && strings.Contains(udpErr.Error(), "timeout") {
-						openPortsMu.Lock()
+						portsMu.Lock()
 						openUDPPorts = append(openUDPPorts, port)
-						openPortsMu.Unlock()
+						portsMu.Unlock()
 						if !bigScan {
-							ui.PrintResult(fmt.Sprintf("UDP Port %s", port), fmt.Errorf("timeout (open|filtered)"), "")
+							emit(ScanResult{Kind: "result", Name: fmt.Sprintf("UDP Port %s", port), Err: fmt.Errorf("timeout (open|filtered)")})
 						}
 					} else if udpErr == nil {
-						openPortsMu.Lock()
+						portsMu.Lock()
 						openUDPPorts = append(openUDPPorts, port)
-						openPortsMu.Unlock()
+						portsMu.Unlock()
 						if bigScan {
-							ui.ClearProgress()
+							emit(ScanResult{Kind: "clear-progress"})
 						}
-						ui.PrintResult(fmt.Sprintf("UDP Port %s", port), nil, "Open")
+						emit(ScanResult{Kind: "result", Name: fmt.Sprintf("UDP Port %s", port), Extra: "Open"})
 					} else if !bigScan {
-						ui.PrintResult(fmt.Sprintf("UDP Port %s", port), udpErr, "")
+						emit(ScanResult{Kind: "result", Name: fmt.Sprintf("UDP Port %s", port), Err: udpErr})
 					}
 				}
-
 				atomic.AddInt32(&scannedPorts, 1)
 			}
 		}()
@@ -187,7 +221,6 @@ func main() {
 		jobs <- portJob{port: p}
 	}
 	close(jobs)
-
 	wg.Wait()
 	if doneCh != nil {
 		close(doneCh)
@@ -196,42 +229,36 @@ func main() {
 	sort.Strings(openTCPPorts)
 	sort.Strings(openUDPPorts)
 
-	// Phase 2 & 3: TLS Detection and Application Layer (skip if -probe-only)
+	// ========== Phase 2 & 3: TLS + Application Layer ==========
 	if !probeOnly {
 		for _, port := range openTCPPorts {
-			ui.PrintSection(fmt.Sprintf("TLS Detection (Port %s)", port))
-			tlsVersions := []uint16{
-				scanner.VersionTLS10,
-				scanner.VersionTLS11,
-				scanner.VersionTLS12,
-				scanner.VersionTLS13,
-			}
+			emit(ScanResult{Kind: "section", Name: fmt.Sprintf("TLS Detection (Port %s)", port)})
 
-			for _, v := range tlsVersions {
+			for _, v := range []uint16{scanner.VersionTLS10, scanner.VersionTLS11, scanner.VersionTLS12, scanner.VersionTLS13} {
 				wg.Add(1)
 				go func(version uint16, port string) {
 					defer wg.Done()
 					cipher, err := scanner.CheckTLS(target, port, version, timeout)
-					name := scanner.TLSVersionName(version)
+					name := fmt.Sprintf("TLS %s", scanner.TLSVersionName(version))
 					if err == nil {
-						ui.PrintResult(fmt.Sprintf("TLS %s", name), nil, fmt.Sprintf("Supported (Cipher: %s)", cipher))
+						emit(ScanResult{Kind: "result", Name: name, Extra: fmt.Sprintf("Supported (Cipher: %s)", cipher)})
 					} else {
-						ui.PrintResult(fmt.Sprintf("TLS %s", name), err, "")
+						emit(ScanResult{Kind: "result", Name: name, Err: err})
 					}
 				}(v, port)
 			}
 			wg.Wait()
 
-			ui.PrintSection(fmt.Sprintf("Application Layer (L7) (Port %s)", port))
+			emit(ScanResult{Kind: "section", Name: fmt.Sprintf("Application Layer (L7) (Port %s)", port)})
 
 			wg.Add(1)
 			go func(port string) {
 				defer wg.Done()
 				proto, err := scanner.CheckHTTP(target, port, timeout)
 				if err == nil {
-					ui.PrintResult("HTTP (over TCP)", nil, fmt.Sprintf("Negotiated: %s", proto))
+					emit(ScanResult{Kind: "result", Name: "HTTP (over TCP)", Extra: fmt.Sprintf("Negotiated: %s", proto)})
 				} else {
-					ui.PrintResult("HTTP (over TCP)", err, "")
+					emit(ScanResult{Kind: "result", Name: "HTTP (over TCP)", Err: err})
 				}
 			}(port)
 
@@ -240,9 +267,9 @@ func main() {
 				defer wg.Done()
 				err := scanner.CheckHTTP3(target, port, timeout)
 				if err == nil {
-					ui.PrintResult("HTTP/3 (QUIC/UDP)", nil, "Supported")
+					emit(ScanResult{Kind: "result", Name: "HTTP/3 (QUIC/UDP)", Extra: "Supported"})
 				} else {
-					ui.PrintResult("HTTP/3 (QUIC/UDP)", err, "")
+					emit(ScanResult{Kind: "result", Name: "HTTP/3 (QUIC/UDP)", Err: err})
 				}
 			}(port)
 
@@ -250,47 +277,40 @@ func main() {
 		}
 	}
 
-	// Phase 4: Proxy Protocol Detection
+	// ========== Phase 4: Proxy Protocol Detection ==========
 	if probeProxy || probeOnly {
 		allProxyResults := make(map[string][]ui.ProbeDisplay)
 
-		// TCP probes on open TCP ports
 		for _, port := range openTCPPorts {
-			ui.PrintSection(fmt.Sprintf("Proxy Protocol Detection (TCP Port %s)", port))
-			results := scanner.RunTCPProbes(target, port, timeout)
-			displays := toDisplays(results)
-			ui.PrintProxyResults(port, displays)
+			emit(ScanResult{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (TCP Port %s)", port)})
+			displays := toDisplays(scanner.RunTCPProbes(target, port, timeout))
+			emit(ScanResult{Kind: "proxy", Port: port, Probes: displays})
 			if len(displays) > 0 {
 				allProxyResults[port] = displays
 			}
 		}
 
-		// UDP probes on open/filtered UDP ports
 		for _, port := range openUDPPorts {
-			ui.PrintSection(fmt.Sprintf("Proxy Protocol Detection (UDP Port %s)", port))
-			results := scanner.RunUDPProbes(target, port, timeout)
-			displays := toDisplays(results)
-			ui.PrintProxyResults(port, displays)
+			emit(ScanResult{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (UDP Port %s)", port)})
+			displays := toDisplays(scanner.RunUDPProbes(target, port, timeout))
+			emit(ScanResult{Kind: "proxy", Port: port, Probes: displays})
 			if len(displays) > 0 {
 				allProxyResults["udp/"+port] = displays
 			}
 		}
 
-		// Summary
-		ui.PrintProxySummary(allProxyResults)
+		emit(ScanResult{Kind: "proxy-summary", AllProbes: allProxyResults})
 	}
 
+	close(results)
+	uiDone.Wait()
 	fmt.Println()
 }
 
 func toDisplays(results []scanner.ProbeResult) []ui.ProbeDisplay {
 	out := make([]ui.ProbeDisplay, len(results))
 	for i, r := range results {
-		out[i] = ui.ProbeDisplay{
-			Protocol:   r.Protocol,
-			Transport:  r.Transport,
-			Confidence: r.Confidence,
-		}
+		out[i] = ui.ProbeDisplay{Protocol: r.Protocol, Transport: r.Transport, Confidence: r.Confidence}
 	}
 	return out
 }

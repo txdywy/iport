@@ -22,6 +22,39 @@ const (
 	VersionTLS13 = tls.VersionTLS13
 )
 
+// Sem is a global concurrency semaphore, set by main via SetSemaphore.
+var sem chan struct{}
+
+// SetSemaphore initializes the global concurrency limiter.
+func SetSemaphore(concurrency int) {
+	sem = make(chan struct{}, concurrency)
+}
+
+// acquire/release wrap the global semaphore. Safe to call if sem is nil.
+func acquire() {
+	if sem != nil {
+		sem <- struct{}{}
+	}
+}
+func release() {
+	if sem != nil {
+		<-sem
+	}
+}
+
+// Singleton HTTP transport — reused across all CheckHTTP calls.
+var sharedHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:      100,
+		IdleConnTimeout:   30 * time.Second,
+		DisableKeepAlives: false,
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse // don't follow redirects
+	},
+}
+
 func TLSVersionName(v uint16) string {
 	switch v {
 	case tls.VersionTLS10:
@@ -37,10 +70,12 @@ func TLSVersionName(v uint16) string {
 	}
 }
 
-// CheckTCP attempts to connect to a TCP port
-func CheckTCP(host string, port string, timeout time.Duration) error {
-	target := net.JoinHostPort(host, port)
-	conn, err := net.DialTimeout("tcp", target, timeout)
+// CheckTCP attempts to connect to a TCP port using context for timeout control.
+func CheckTCP(host, port string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	if err != nil {
 		return err
 	}
@@ -48,23 +83,22 @@ func CheckTCP(host string, port string, timeout time.Duration) error {
 	return nil
 }
 
-// CheckUDP attempts to send a packet to a UDP port and waits for an ICMP unreachable.
-// Note: This is a basic UDP check. Many firewalls silently drop UDP packets.
-func CheckUDP(host string, port string, timeout time.Duration) error {
-	target := net.JoinHostPort(host, port)
-	conn, err := net.DialTimeout("udp", target, timeout)
+// CheckUDP sends a packet to a UDP port and waits for an ICMP unreachable.
+func CheckUDP(host, port string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "udp", net.JoinHostPort(host, port))
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	// Send a single-byte packet (empty write may be a no-op on some systems)
 	if _, err = conn.Write([]byte{0}); err != nil {
 		return err
 	}
 
 	conn.SetReadDeadline(time.Now().Add(timeout))
-
 	buffer := make([]byte, 1024)
 	_, err = conn.Read(buffer)
 	if err != nil {
@@ -76,13 +110,13 @@ func CheckUDP(host string, port string, timeout time.Duration) error {
 	return nil
 }
 
-// Ping sends an ICMP Echo Request
+// Ping sends an ICMP Echo Request, trying unprivileged UDP ping first,
+// then falling back to raw socket (requires root).
 func Ping(host string, timeout time.Duration) (time.Duration, error) {
 	ips, err := net.LookupIP(host)
 	if err != nil {
 		return 0, err
 	}
-
 	var ip net.IP
 	for _, i := range ips {
 		if i.To4() != nil {
@@ -94,12 +128,34 @@ func Ping(host string, timeout time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("no IPv4 address found")
 	}
 
-	c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	// Try unprivileged UDP ping first (works without root on most systems)
+	if rtt, err := pingUDP(ip, timeout); err == nil {
+		return rtt, nil
+	}
+
+	// Fallback to raw ICMP socket (requires root/CAP_NET_RAW)
+	return pingRaw(ip, timeout)
+}
+
+func pingUDP(ip net.IP, timeout time.Duration) (time.Duration, error) {
+	c, err := icmp.ListenPacket("udp4", "0.0.0.0")
 	if err != nil {
-		return 0, fmt.Errorf("icmp listen requires root privileges")
+		return 0, err
 	}
 	defer c.Close()
+	return doPing(c, &net.UDPAddr{IP: ip}, timeout)
+}
 
+func pingRaw(ip net.IP, timeout time.Duration) (time.Duration, error) {
+	c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	if err != nil {
+		return 0, fmt.Errorf("ping requires root privileges or unprivileged ICMP support")
+	}
+	defer c.Close()
+	return doPing(c, &net.IPAddr{IP: ip}, timeout)
+}
+
+func doPing(c *icmp.PacketConn, dst net.Addr, timeout time.Duration) (time.Duration, error) {
 	wm := icmp.Message{
 		Type: ipv4.ICMPTypeEcho, Code: 0,
 		Body: &icmp.Echo{
@@ -113,7 +169,7 @@ func Ping(host string, timeout time.Duration) (time.Duration, error) {
 	}
 
 	start := time.Now()
-	if _, err := c.WriteTo(wb, &net.IPAddr{IP: ip}); err != nil {
+	if _, err := c.WriteTo(wb, dst); err != nil {
 		return 0, err
 	}
 
@@ -135,94 +191,97 @@ func Ping(host string, timeout time.Duration) (time.Duration, error) {
 	return 0, fmt.Errorf("unexpected ICMP type: %v", rm.Type)
 }
 
-// CheckTLS checks if a specific TLS version is supported
-func CheckTLS(host string, port string, version uint16, timeout time.Duration) (string, error) {
-	target := net.JoinHostPort(host, port)
+// CheckTLS checks if a specific TLS version is supported.
+func CheckTLS(host, port string, version uint16, timeout time.Duration) (string, error) {
+	acquire()
+	defer release()
 
-	conf := &tls.Config{
-		InsecureSkipVerify: true,
-		MinVersion:         version,
-		MaxVersion:         version,
-		ServerName:         host,
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	d := tls.Dialer{
+		Config: &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         version,
+			MaxVersion:         version,
+			ServerName:         host,
+		},
 	}
-
-	dialer := &net.Dialer{Timeout: timeout}
-	conn, err := tls.DialWithDialer(dialer, "tcp", target, conf)
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	if err != nil {
 		return "", err
 	}
 	defer conn.Close()
 
-	state := conn.ConnectionState()
+	tlsConn := conn.(*tls.Conn)
+	state := tlsConn.ConnectionState()
 	return tls.CipherSuiteName(state.CipherSuite), nil
 }
 
-// CheckHTTP checks standard HTTP/HTTPS and ALPN negotiation
-func CheckHTTP(host string, port string, timeout time.Duration) (string, error) {
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	defer tr.CloseIdleConnections()
+// CheckHTTP checks standard HTTP/HTTPS and ALPN negotiation.
+// Uses a singleton transport and proper context-based timeout.
+func CheckHTTP(host, port string, timeout time.Duration) (string, error) {
+	acquire()
+	defer release()
 
-	client := &http.Client{Timeout: timeout, Transport: tr}
-
-	// Determine scheme based on port
 	scheme := "https"
 	if port == "80" {
 		scheme = "http"
 	}
-
 	urlHost := host
 	if port != "80" && port != "443" {
 		urlHost = net.JoinHostPort(host, port)
 	}
 
-	resp, err := client.Get(scheme + "://" + urlHost)
-	if err != nil {
-		if resp != nil {
-			resp.Body.Close()
-		}
+	proto, err := doHTTPGet(scheme, urlHost, timeout)
+	if err != nil && port != "80" && port != "443" {
 		// Fallback: try the other scheme for non-standard ports
-		if port != "80" && port != "443" {
-			alt := "http"
-			if scheme == "http" {
-				alt = "https"
-			}
-			resp, err = client.Get(alt + "://" + urlHost)
-			if err != nil {
-				if resp != nil {
-					resp.Body.Close()
-				}
-				return "", err
-			}
-		} else {
-			return "", err
+		alt := "http"
+		if scheme == "http" {
+			alt = "https"
 		}
+		proto, err = doHTTPGet(alt, urlHost, timeout)
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	return proto, err
+}
+
+func doHTTPGet(scheme, urlHost string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", scheme+"://"+urlHost, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := sharedHTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
 
 	proto := resp.Proto
 	if resp.TLS != nil && resp.TLS.NegotiatedProtocol != "" {
 		proto = resp.TLS.NegotiatedProtocol
 	}
-
 	return fmt.Sprintf("%s (Status: %d)", proto, resp.StatusCode), nil
 }
 
-// CheckHTTP3 checks QUIC / HTTP3 support
-func CheckHTTP3(host string, port string, timeout time.Duration) error {
-	target := net.JoinHostPort(host, port)
-
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"h3"},
-	}
+// CheckHTTP3 checks QUIC / HTTP3 support.
+func CheckHTTP3(host, port string, timeout time.Duration) error {
+	acquire()
+	defer release()
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	conn, err := quic.DialAddr(ctx, target, tlsConf, &quic.Config{})
+	conn, err := quic.DialAddr(ctx, net.JoinHostPort(host, port), &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3"},
+	}, &quic.Config{})
 	if err != nil {
 		return err
 	}
