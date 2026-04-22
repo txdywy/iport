@@ -19,7 +19,7 @@ var Version = "dev"
 
 // ScanResult is the decoupled result type — scanner produces, UI consumes.
 type ScanResult struct {
-	Kind        string // "section", "result", "proxy", "proxy-summary", "progress", "clear-progress"
+	Kind        string // "section", "result", "proxy", "proxy-summary", "progress", "clear-progress", "ports"
 	Name        string
 	Err         error
 	Extra       string
@@ -28,6 +28,16 @@ type ScanResult struct {
 	Probes      []ui.ProbeDisplay
 	AllProbes   map[string][]ui.ProbeDisplay
 	Total, Done int
+}
+
+func isFlagPassed(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 func main() {
@@ -102,7 +112,7 @@ func main() {
 		for i := range portList {
 			portList[i] = strconv.Itoa(i + 1)
 		}
-		if !probeOnly {
+		if !isFlagPassed("probe") && !probeOnly {
 			probeProxy = false
 		}
 	} else {
@@ -119,17 +129,14 @@ func main() {
 	// Scan mode:
 	// Default (no flags): TCP+UDP on specified ports
 	// -T: TCP only, -U: UDP only, -T -U: both
-	// -A: all 65535 ports, always TCP+UDP
+	// -A: all 65535 ports, always TCP+UDP (unless explicitly overridden by -T or -U)
 	scanTCP := true
 	scanUDP := true
 	if tcpOnly || udpScan {
 		scanTCP = tcpOnly
 		scanUDP = udpScan
 	}
-	if allPorts {
-		scanTCP = true
-		scanUDP = true
-	}
+
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	bigScan := len(portList) > 100
 
@@ -348,20 +355,6 @@ func main() {
 					appResults = append(appResults, r)
 					appMu.Unlock()
 				}()
-				if scanUDP {
-					appWG.Add(1)
-					go func() {
-						defer appWG.Done()
-						err := scanner.CheckHTTP3(target, port, timeout)
-						r := ScanResult{Kind: "result", Name: "HTTP/3 (QUIC/UDP)", Err: err}
-						if err == nil {
-							r.Extra = "Supported"
-						}
-						appMu.Lock()
-						appResults = append(appResults, r)
-						appMu.Unlock()
-					}()
-				}
 				appWG.Wait()
 				batch = append(batch, appResults...)
 
@@ -371,21 +364,34 @@ func main() {
 		}
 		wg.Wait()
 
-		// HTTP/3 check on open UDP ports (for -U mode where TCP ports aren't scanned)
-		if !scanTCP && scanUDP {
-			for _, port := range openUDPPorts {
+		// HTTP/3 check on UDP ports (both open and open|filtered) independently of TCP
+		if scanUDP {
+			var combinedUDPPorts []string
+			combinedUDPPorts = append(combinedUDPPorts, openUDPPorts...)
+			combinedUDPPorts = append(combinedUDPPorts, openUDPFilteredPorts...)
+			
+			// Deduplicate UDP ports
+			udpPortMap := make(map[string]bool)
+			var uniqueUDPPorts []string
+			for _, port := range combinedUDPPorts {
+				if !udpPortMap[port] {
+					udpPortMap[port] = true
+					uniqueUDPPorts = append(uniqueUDPPorts, port)
+				}
+			}
+			
+			for _, port := range uniqueUDPPorts {
 				wg.Add(1)
 				go func(port string) {
 					defer wg.Done()
 					err := scanner.CheckHTTP3(target, port, timeout)
-					r := ScanResult{Kind: "result", Name: "HTTP/3 (QUIC/UDP)", Err: err}
 					if err == nil {
-						r.Extra = "Supported"
+						r := ScanResult{Kind: "result", Name: "HTTP/3 (QUIC/UDP)", Err: err, Extra: "Supported"}
+						emitBatch([]ScanResult{
+							{Kind: "section", Name: fmt.Sprintf("Application Layer (L7) (UDP Port %s)", port)},
+							r,
+						})
 					}
-					emitBatch([]ScanResult{
-						{Kind: "section", Name: fmt.Sprintf("Application Layer (L7) (UDP Port %s)", port)},
-						r,
-					})
 				}(port)
 			}
 			wg.Wait()
@@ -402,11 +408,11 @@ func main() {
 			go func(port string) {
 				defer wg.Done()
 				displays := toDisplays(scanner.RunTCPProbes(target, port, timeout))
-				emitBatch([]ScanResult{
-					{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (TCP Port %s)", port)},
-					{Kind: "proxy", Port: port, Probes: displays},
-				})
 				if len(displays) > 0 {
+					emitBatch([]ScanResult{
+						{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (TCP Port %s)", port)},
+						{Kind: "proxy", Port: port, Probes: displays},
+					})
 					proxyMu.Lock()
 					allProxyResults[port] = displays
 					proxyMu.Unlock()
@@ -414,16 +420,33 @@ func main() {
 			}(port)
 		}
 
-		for _, port := range openUDPPorts {
+		// Combined UDP ports for proxy protocol detection
+		var proxyUDPPorts []string
+		proxyUDPPorts = append(proxyUDPPorts, openUDPPorts...)
+		if bigScan {
+			proxyUDPPorts = append(proxyUDPPorts, openUDPFilteredPorts...)
+		}
+		
+		// Deduplicate UDP ports
+		udpPortMap := make(map[string]bool)
+		var uniqueProxyUDPPorts []string
+		for _, port := range proxyUDPPorts {
+			if !udpPortMap[port] {
+				udpPortMap[port] = true
+				uniqueProxyUDPPorts = append(uniqueProxyUDPPorts, port)
+			}
+		}
+
+		for _, port := range uniqueProxyUDPPorts {
 			wg.Add(1)
 			go func(port string) {
 				defer wg.Done()
 				displays := toDisplays(scanner.RunUDPProbes(target, port, timeout))
-				emitBatch([]ScanResult{
-					{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (UDP Port %s)", port)},
-					{Kind: "proxy", Port: port, Probes: displays},
-				})
 				if len(displays) > 0 {
+					emitBatch([]ScanResult{
+						{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (UDP Port %s)", port)},
+						{Kind: "proxy", Port: port, Probes: displays},
+					})
 					proxyMu.Lock()
 					allProxyResults["udp/"+port] = displays
 					proxyMu.Unlock()
