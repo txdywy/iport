@@ -57,7 +57,7 @@ func main() {
 	flag.BoolVar(&showVersion, "V", false, "Show version and exit")
 	flag.BoolVar(&allPorts, "A", false, "Scan all 65535 ports")
 	flag.BoolVar(&tcpOnly, "T", false, "TCP only, skip UDP scanning and HTTP/3")
-	flag.BoolVar(&udpScan, "U", false, "Include UDP scanning (use with -A for full TCP+UDP)")
+	flag.BoolVar(&udpScan, "U", false, "UDP only, skip TCP scanning")
 	flag.IntVar(&concurrency, "c", 1000, "Maximum concurrent scans")
 	flag.BoolVar(&probeProxy, "probe", true, "Enable proxy protocol detection")
 	flag.BoolVar(&probeOnly, "probe-only", false, "Skip TLS/HTTP, only run proxy probes")
@@ -115,12 +115,20 @@ func main() {
 		}
 	}
 
-	// UDP scanning: on by default for specific ports, off for -A (use -U to enable), off for -T
+	// Scan mode: -T = TCP only, -U = UDP only, neither = both
+	// -A -U = all UDP ports, -A -T = all TCP ports, -A = all TCP ports (default)
+	scanTCP := true
 	scanUDP := true
+	if tcpOnly && udpScan {
+		fmt.Println("Error: -T and -U are mutually exclusive. Use neither for TCP+UDP.")
+		os.Exit(1)
+	}
 	if tcpOnly {
 		scanUDP = false
-	} else if allPorts && !udpScan {
-		scanUDP = false // -A defaults to TCP-only for performance; -A -U enables UDP
+	} else if udpScan {
+		scanTCP = false
+	} else if allPorts {
+		scanUDP = false // -A alone defaults to TCP only for performance
 	}
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	bigScan := len(portList) > 100
@@ -212,16 +220,18 @@ func main() {
 			defer wg.Done()
 			for job := range jobs {
 				port := job.port
-				if err := scanner.CheckTCP(target, port, timeout); err == nil {
-					portsMu.Lock()
-					openTCPPorts = append(openTCPPorts, port)
-					portsMu.Unlock()
-					if bigScan {
-						emit(ScanResult{Kind: "clear-progress"})
+				if scanTCP {
+					if err := scanner.CheckTCP(target, port, timeout); err == nil {
+						portsMu.Lock()
+						openTCPPorts = append(openTCPPorts, port)
+						portsMu.Unlock()
+						if bigScan {
+							emit(ScanResult{Kind: "clear-progress"})
+						}
+						emit(ScanResult{Kind: "result", Name: fmt.Sprintf("TCP Port %s", port), Extra: "Open"})
+					} else if !bigScan {
+						emit(ScanResult{Kind: "result", Name: fmt.Sprintf("TCP Port %s", port), Err: err})
 					}
-					emit(ScanResult{Kind: "result", Name: fmt.Sprintf("TCP Port %s", port), Extra: "Open"})
-				} else if !bigScan {
-					emit(ScanResult{Kind: "result", Name: fmt.Sprintf("TCP Port %s", port), Err: err})
 				}
 
 				if scanUDP {
