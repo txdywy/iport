@@ -487,6 +487,7 @@ func main() {
 
 	close(results)
 	uiDone.Wait()
+	scanner.CleanupHTTPClient()
 	fmt.Println()
 }
 

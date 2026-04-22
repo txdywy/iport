@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"io"
@@ -47,20 +48,27 @@ func probeReality(host, port string, timeout time.Duration) []ProbeResult {
 		confidence += 5
 	}
 
-	// IP-vs-SNI mismatch: resolve the cert's domain and compare with target IP.
-	// Reality borrows certs from real sites, so the cert domain resolves to different IPs.
-	targetIPs, _ := net.LookupIP(host)
+	// Use pinned IP directly instead of re-resolving
+	var targetIPs []net.IP
+	if ip := getPinnedIP(); ip != "" {
+		targetIPs = []net.IP{net.ParseIP(ip)}
+	} else {
+		targetIPs, _ = net.LookupIP(host)
+	}
 	certDomain := info.CertCN
 	if len(info.CertSANs) > 0 {
 		certDomain = info.CertSANs[0]
 	}
-	if certDomain != "" {
-		certIPs, err := net.LookupIP(certDomain)
-		if err == nil && len(certIPs) > 0 && len(targetIPs) > 0 {
+	if certDomain != "" && len(targetIPs) > 0 {
+		// Use context-bounded DNS for cert domain to avoid long blocks
+		ctx, cancel := context.WithTimeout(context.Background(), timeout/2)
+		defer cancel()
+		certIPs, err := net.DefaultResolver.LookupIPAddr(ctx, certDomain)
+		if err == nil && len(certIPs) > 0 {
 			match := false
 			for _, tip := range targetIPs {
 				for _, cip := range certIPs {
-					if tip.Equal(cip) {
+					if tip.Equal(cip.IP) {
 						match = true
 					}
 				}
@@ -280,18 +288,15 @@ func probeNaiveProxy(host, port string, timeout time.Duration) []ProbeResult {
 		ServerName:         host,
 		NextProtos:         []string{"h2"},
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", dialTarget(host, port), tlsConf)
-	if err != nil {
-		return nil
-	}
-	defer conn.Close()
 
-	if conn.ConnectionState().NegotiatedProtocol != "h2" {
-		return nil
+	// Use http2.Transport with DialTLSContext to ensure DNS pinning and single connection
+	t := &http2.Transport{
+		TLSClientConfig: tlsConf,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			d := &net.Dialer{Timeout: timeout}
+			return tls.DialWithDialer(d, "tcp", dialTarget(host, port), tlsConf)
+		},
 	}
-
-	// Use HTTP/2 to send CONNECT request (NaïveProxy style)
-	t := &http2.Transport{TLSClientConfig: tlsConf}
 	defer t.CloseIdleConnections()
 
 	url := "https://" + URLHost(host, port)
@@ -304,21 +309,18 @@ func probeNaiveProxy(host, port string, timeout time.Duration) []ProbeResult {
 	client := &http.Client{Transport: t, Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		// Some NaïveProxy configs may reject malformed CONNECT
 		if strings.Contains(err.Error(), "407") {
 			return []ProbeResult{{Protocol: "NaïveProxy", Transport: "TLS+H2", Confidence: 70}}
 		}
 		return nil
 	}
-	defer resp.Body.Close()
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
 
 	switch resp.StatusCode {
 	case 407:
-		// Proxy Authentication Required — strong NaïveProxy signal
 		return []ProbeResult{{Protocol: "NaïveProxy", Transport: "TLS+H2", Confidence: 70}}
 	case 200:
-		// Open proxy via H2 CONNECT — could be NaïveProxy without auth
 		return []ProbeResult{{Protocol: "NaïveProxy", Transport: "TLS+H2", Confidence: 55}}
 	case 403, 401:
 		return []ProbeResult{{Protocol: "NaïveProxy", Transport: "TLS+H2", Confidence: 50}}

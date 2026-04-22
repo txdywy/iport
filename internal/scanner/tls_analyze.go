@@ -8,19 +8,28 @@ import (
 	"math"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/txdywy/iport/internal/netutil"
 )
 
-// pinnedIP is set by PinTarget to ensure all probes hit the same server.
-var pinnedIP string
+// pinnedIPVal is set by PinTarget to ensure all probes hit the same server.
+var pinnedIPVal atomic.Value // stores string
+
+func getPinnedIP() string {
+	v := pinnedIPVal.Load()
+	if v == nil {
+		return ""
+	}
+	return v.(string)
+}
 
 // PinTarget resolves a hostname once and pins the IP for all subsequent dial operations.
 func PinTarget(host string) (string, error) {
 	if ip := net.ParseIP(host); ip != nil {
-		pinnedIP = ip.String()
-		return pinnedIP, nil
+		pinnedIPVal.Store(ip.String())
+		return ip.String(), nil
 	}
 	ips, err := net.LookupIP(host)
 	if err != nil {
@@ -28,21 +37,21 @@ func PinTarget(host string) (string, error) {
 	}
 	for _, ip := range ips {
 		if ip.To4() != nil {
-			pinnedIP = ip.String()
-			return pinnedIP, nil
+			pinnedIPVal.Store(ip.String())
+			return ip.String(), nil
 		}
 	}
 	if len(ips) > 0 {
-		pinnedIP = ips[0].String()
-		return pinnedIP, nil
+		pinnedIPVal.Store(ips[0].String())
+		return ips[0].String(), nil
 	}
 	return "", fmt.Errorf("no IP found for %s", host)
 }
 
 // dialTarget returns host:port using the pinned IP if available.
 func dialTarget(host, port string) string {
-	if pinnedIP != "" {
-		return net.JoinHostPort(pinnedIP, port)
+	if ip := getPinnedIP(); ip != "" {
+		return net.JoinHostPort(ip, port)
 	}
 	return net.JoinHostPort(host, port)
 }
@@ -54,9 +63,9 @@ func dialTCP(host, port string, timeout time.Duration) (net.Conn, error) {
 
 // pinnedDialContext is a net.Dialer.DialContext replacement that uses the pinned IP.
 func pinnedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	if pinnedIP != "" {
+	if ip := getPinnedIP(); ip != "" {
 		_, port, _ := net.SplitHostPort(addr)
-		addr = net.JoinHostPort(pinnedIP, port)
+		addr = net.JoinHostPort(ip, port)
 	}
 	return (&net.Dialer{}).DialContext(ctx, network, addr)
 }

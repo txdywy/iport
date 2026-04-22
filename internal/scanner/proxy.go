@@ -29,7 +29,7 @@ var (
 )
 
 // Max concurrent probes per port to prevent FD exhaustion.
-const maxProbeParallel = 8
+const maxProbeParallel = 4
 
 // RunTCPProbes runs all registered TCP probes with bounded concurrency and a total timeout budget.
 func RunTCPProbes(host, port string, timeout time.Duration) []ProbeResult {
@@ -99,6 +99,32 @@ func aggregateResults(results []ProbeResult) []ProbeResult {
 			merged[k] = r.Confidence
 		}
 	}
+
+	// Suppress mutually exclusive protocols — keep only the higher-confidence one
+	exclusivePairs := [][2]string{
+		{"VLESS+Reality", "ShadowTLS"},
+	}
+	for _, pair := range exclusivePairs {
+		var k0, k1 key
+		var c0, c1 float64
+		var found0, found1 bool
+		for k, c := range merged {
+			if k.proto == pair[0] {
+				k0, c0, found0 = k, c, true
+			}
+			if k.proto == pair[1] {
+				k1, c1, found1 = k, c, true
+			}
+		}
+		if found0 && found1 {
+			if c0 >= c1 {
+				delete(merged, k1)
+			} else {
+				delete(merged, k0)
+			}
+		}
+	}
+
 	out := make([]ProbeResult, 0, len(merged))
 	for k, c := range merged {
 		out = append(out, ProbeResult{Protocol: k.proto, Transport: k.transport, Confidence: c})

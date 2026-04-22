@@ -201,7 +201,7 @@ func extractWSPayload(frame []byte) []byte {
 		offset += 4
 	}
 	if offset+payloadLen > len(frame) {
-		payloadLen = len(frame) - offset
+		return nil // frame truncated, skip to avoid false positives
 	}
 	if payloadLen <= 0 {
 		return nil

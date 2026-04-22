@@ -150,8 +150,7 @@ func probeQUIC(host, port string, timeout time.Duration, alpn []string, proto st
 			return []ProbeResult{{Protocol: proto, Transport: "QUIC", Confidence: confidence}}
 		}
 	}
-	// QUIC connected but ALPN didn't match exactly — still suspicious
-	return []ProbeResult{{Protocol: proto, Transport: "QUIC", Confidence: confidence * 0.6}}
+	return nil
 }
 
 func probeMKCP(host, port string, timeout time.Duration) []ProbeResult {

@@ -59,10 +59,16 @@ func init() {
 	}
 	sharedHTTPClient = &http.Client{
 		Transport: tr,
+		Timeout:   30 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+// CleanupHTTPClient closes idle connections on the shared HTTP client.
+func CleanupHTTPClient() {
+	sharedHTTPClient.Transport.(*http.Transport).CloseIdleConnections()
 }
 
 func TLSVersionName(v uint16) string {
@@ -133,8 +139,8 @@ func CheckUDP(host, port string, timeout time.Duration) error {
 // Tries unprivileged UDP ping first, then falls back to raw socket.
 func Ping(host string, timeout time.Duration) (time.Duration, error) {
 	var ips []net.IP
-	if pinnedIP != "" {
-		ips = []net.IP{net.ParseIP(pinnedIP)}
+	if ip := getPinnedIP(); ip != "" {
+		ips = []net.IP{net.ParseIP(ip)}
 	} else {
 		var err error
 		ips, err = net.LookupIP(host)
