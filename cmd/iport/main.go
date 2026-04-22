@@ -82,6 +82,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate concurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+
 	// Initialize global concurrency semaphore
 	scanner.SetSemaphore(concurrency)
 
@@ -98,9 +103,10 @@ func main() {
 		if ports == "" {
 			ports = "80,443"
 		}
-		portList = strings.Split(ports, ",")
-		for i := range portList {
-			portList[i] = strings.TrimSpace(portList[i])
+		portList = parseAndValidatePorts(ports)
+		if len(portList) == 0 {
+			fmt.Println("Error: no valid ports specified. Ports must be integers 1-65535.")
+			os.Exit(1)
 		}
 	}
 
@@ -200,9 +206,7 @@ func main() {
 				if scanUDP {
 					udpErr := scanner.CheckUDP(target, port, timeout)
 					if udpErr != nil && strings.Contains(udpErr.Error(), "timeout") {
-						portsMu.Lock()
-						openUDPPorts = append(openUDPPorts, port)
-						portsMu.Unlock()
+						// open|filtered — display only, do NOT feed into proxy detection
 						if !bigScan {
 							emit(ScanResult{Kind: "result", Name: fmt.Sprintf("UDP Port %s", port), Err: fmt.Errorf("timeout (open|filtered)")})
 						}
@@ -239,73 +243,90 @@ func main() {
 	// ========== Phase 2 & 3: TLS + Application Layer ==========
 	if !probeOnly {
 		for _, port := range openTCPPorts {
-			emit(ScanResult{Kind: "section", Name: fmt.Sprintf("TLS Detection (Port %s)", port)})
+			wg.Add(1)
+			go func(port string) {
+				defer wg.Done()
 
-			for _, v := range []uint16{scanner.VersionTLS10, scanner.VersionTLS11, scanner.VersionTLS12, scanner.VersionTLS13} {
-				wg.Add(1)
-				go func(version uint16, port string) {
-					defer wg.Done()
-					cipher, err := scanner.CheckTLS(target, port, version, timeout)
-					name := fmt.Sprintf("TLS %s", scanner.TLSVersionName(version))
+				emit(ScanResult{Kind: "section", Name: fmt.Sprintf("TLS Detection (Port %s)", port)})
+				var tlsWG sync.WaitGroup
+				for _, v := range []uint16{scanner.VersionTLS10, scanner.VersionTLS11, scanner.VersionTLS12, scanner.VersionTLS13} {
+					tlsWG.Add(1)
+					go func(version uint16) {
+						defer tlsWG.Done()
+						cipher, err := scanner.CheckTLS(target, port, version, timeout)
+						name := fmt.Sprintf("TLS %s", scanner.TLSVersionName(version))
+						if err == nil {
+							emit(ScanResult{Kind: "result", Name: name, Extra: fmt.Sprintf("Supported (Cipher: %s)", cipher)})
+						} else {
+							emit(ScanResult{Kind: "result", Name: name, Err: err})
+						}
+					}(v)
+				}
+				tlsWG.Wait()
+
+				emit(ScanResult{Kind: "section", Name: fmt.Sprintf("Application Layer (L7) (Port %s)", port)})
+				var appWG sync.WaitGroup
+				appWG.Add(2)
+				go func() {
+					defer appWG.Done()
+					proto, err := scanner.CheckHTTP(target, port, timeout)
 					if err == nil {
-						emit(ScanResult{Kind: "result", Name: name, Extra: fmt.Sprintf("Supported (Cipher: %s)", cipher)})
+						emit(ScanResult{Kind: "result", Name: "HTTP (over TCP)", Extra: fmt.Sprintf("Negotiated: %s", proto)})
 					} else {
-						emit(ScanResult{Kind: "result", Name: name, Err: err})
+						emit(ScanResult{Kind: "result", Name: "HTTP (over TCP)", Err: err})
 					}
-				}(v, port)
-			}
-			wg.Wait()
-
-			emit(ScanResult{Kind: "section", Name: fmt.Sprintf("Application Layer (L7) (Port %s)", port)})
-
-			wg.Add(1)
-			go func(port string) {
-				defer wg.Done()
-				proto, err := scanner.CheckHTTP(target, port, timeout)
-				if err == nil {
-					emit(ScanResult{Kind: "result", Name: "HTTP (over TCP)", Extra: fmt.Sprintf("Negotiated: %s", proto)})
-				} else {
-					emit(ScanResult{Kind: "result", Name: "HTTP (over TCP)", Err: err})
-				}
+				}()
+				go func() {
+					defer appWG.Done()
+					err := scanner.CheckHTTP3(target, port, timeout)
+					if err == nil {
+						emit(ScanResult{Kind: "result", Name: "HTTP/3 (QUIC/UDP)", Extra: "Supported"})
+					} else {
+						emit(ScanResult{Kind: "result", Name: "HTTP/3 (QUIC/UDP)", Err: err})
+					}
+				}()
+				appWG.Wait()
 			}(port)
-
-			wg.Add(1)
-			go func(port string) {
-				defer wg.Done()
-				err := scanner.CheckHTTP3(target, port, timeout)
-				if err == nil {
-					emit(ScanResult{Kind: "result", Name: "HTTP/3 (QUIC/UDP)", Extra: "Supported"})
-				} else {
-					emit(ScanResult{Kind: "result", Name: "HTTP/3 (QUIC/UDP)", Err: err})
-				}
-			}(port)
-
-			wg.Wait()
 		}
+		wg.Wait()
 	}
 
 	// ========== Phase 4: Proxy Protocol Detection ==========
 	if probeProxy || probeOnly {
 		allProxyResults := make(map[string][]ui.ProbeDisplay)
+		var proxyMu sync.Mutex
 
 		for _, port := range openTCPPorts {
-			emit(ScanResult{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (TCP Port %s)", port)})
-			displays := toDisplays(scanner.RunTCPProbes(target, port, timeout))
-			emit(ScanResult{Kind: "proxy", Port: port, Probes: displays})
-			if len(displays) > 0 {
-				allProxyResults[port] = displays
-			}
+			wg.Add(1)
+			go func(port string) {
+				defer wg.Done()
+				emit(ScanResult{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (TCP Port %s)", port)})
+				displays := toDisplays(scanner.RunTCPProbes(target, port, timeout))
+				emit(ScanResult{Kind: "proxy", Port: port, Probes: displays})
+				if len(displays) > 0 {
+					proxyMu.Lock()
+					allProxyResults[port] = displays
+					proxyMu.Unlock()
+				}
+			}(port)
 		}
 
 		for _, port := range openUDPPorts {
-			emit(ScanResult{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (UDP Port %s)", port)})
-			displays := toDisplays(scanner.RunUDPProbes(target, port, timeout))
-			emit(ScanResult{Kind: "proxy", Port: port, Probes: displays})
-			if len(displays) > 0 {
-				allProxyResults["udp/"+port] = displays
-			}
+			wg.Add(1)
+			go func(port string) {
+				defer wg.Done()
+				emit(ScanResult{Kind: "section", Name: fmt.Sprintf("Proxy Protocol Detection (UDP Port %s)", port)})
+				displays := toDisplays(scanner.RunUDPProbes(target, port, timeout))
+				emit(ScanResult{Kind: "proxy", Port: port, Probes: displays})
+				if len(displays) > 0 {
+					proxyMu.Lock()
+					allProxyResults["udp/"+port] = displays
+					proxyMu.Unlock()
+				}
+			}(port)
 		}
 
+		wg.Wait()
 		emit(ScanResult{Kind: "proxy-summary", AllProbes: allProxyResults})
 	}
 
@@ -320,4 +341,19 @@ func toDisplays(results []scanner.ProbeResult) []ui.ProbeDisplay {
 		out[i] = ui.ProbeDisplay{Protocol: r.Protocol, Transport: r.Transport, Confidence: r.Confidence}
 	}
 	return out
+}
+
+func parseAndValidatePorts(ports string) []string {
+	seen := map[int]bool{}
+	var valid []string
+	for _, s := range strings.Split(ports, ",") {
+		s = strings.TrimSpace(s)
+		p, err := strconv.Atoi(s)
+		if err != nil || p < 1 || p > 65535 || seen[p] {
+			continue
+		}
+		seen[p] = true
+		valid = append(valid, strconv.Itoa(p))
+	}
+	return valid
 }

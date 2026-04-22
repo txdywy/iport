@@ -255,22 +255,22 @@ func probeGRPC(host, port string, timeout time.Duration) []ProbeResult {
 }
 
 // probeHTTPUpgrade detects V2Ray HTTPUpgrade transport.
-// Similar to WebSocket but uses a simpler HTTP upgrade mechanism.
+// Uses independent connection per path to avoid corrupted state.
 func probeHTTPUpgrade(host, port string, timeout time.Duration) []ProbeResult {
-	conn, err := dialTLSRaw(host, port, timeout)
-	if err != nil {
-		return nil
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(timeout))
-
 	for _, path := range []string{"/", "/httpupgrade", "/upgrade"} {
+		conn, err := dialTLSRaw(host, port, timeout)
+		if err != nil {
+			return nil
+		}
+		conn.SetDeadline(time.Now().Add(timeout))
+
 		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
 			path, host)
 		conn.Write([]byte(req))
 
 		reader := bufio.NewReader(conn)
 		line, err := reader.ReadString('\n')
+		conn.Close()
 		if err != nil {
 			continue
 		}

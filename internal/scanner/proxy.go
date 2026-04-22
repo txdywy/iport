@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -27,25 +28,53 @@ var (
 	AllUDPProbes []NamedProbe
 )
 
-// RunTCPProbes runs all registered TCP probes concurrently and returns aggregated results.
+// Max concurrent probes per port to prevent FD exhaustion.
+const maxProbeParallel = 8
+
+// RunTCPProbes runs all registered TCP probes with bounded concurrency and a total timeout budget.
 func RunTCPProbes(host, port string, timeout time.Duration) []ProbeResult {
 	return runProbes(AllTCPProbes, host, port, timeout)
 }
 
-// RunUDPProbes runs all registered UDP probes concurrently and returns aggregated results.
+// RunUDPProbes runs all registered UDP probes with bounded concurrency and a total timeout budget.
 func RunUDPProbes(host, port string, timeout time.Duration) []ProbeResult {
 	return runProbes(AllUDPProbes, host, port, timeout)
 }
 
 func runProbes(probes []NamedProbe, host, port string, timeout time.Duration) []ProbeResult {
+	// Total budget: 3x single probe timeout, so we don't wait forever
+	ctx, cancel := context.WithTimeout(context.Background(), timeout*3)
+	defer cancel()
+
 	var mu sync.Mutex
 	var all []ProbeResult
 	var wg sync.WaitGroup
+
+	// Local semaphore to limit concurrent probes per port
+	probeSem := make(chan struct{}, maxProbeParallel)
 
 	for _, p := range probes {
 		wg.Add(1)
 		go func(probe NamedProbe) {
 			defer wg.Done()
+
+			// Acquire local semaphore (or bail if budget expired)
+			select {
+			case probeSem <- struct{}{}:
+				defer func() { <-probeSem }()
+			case <-ctx.Done():
+				return
+			}
+
+			// Also acquire global semaphore
+			acquire()
+			defer release()
+
+			// Check budget before running
+			if ctx.Err() != nil {
+				return
+			}
+
 			results := probe.Fn(host, port, timeout)
 			if len(results) > 0 {
 				mu.Lock()
@@ -65,7 +94,6 @@ func aggregateResults(results []ProbeResult) []ProbeResult {
 	for _, r := range results {
 		k := key{r.Protocol, r.Transport}
 		if prev, ok := merged[k]; ok {
-			// P(A∪B) = 1 - (1-A)(1-B)
 			merged[k] = 100 * (1 - (1-prev/100)*(1-r.Confidence/100))
 		} else {
 			merged[k] = r.Confidence

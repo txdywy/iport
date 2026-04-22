@@ -41,20 +41,16 @@ func probeTrojan(host, port string, timeout time.Duration) []ProbeResult {
 	conn1.SetWriteDeadline(time.Now().Add(shortTimeout))
 	conn1.Write([]byte(trojanReq))
 
-	resp1, err1 := readWithTimeout(conn1, shortTimeout)
+	resp1, _ := readWithTimeout(conn1, shortTimeout)
 
 	// Probe 2: Send plain HTTP GET for comparison
 	conn2, err2 := dialTLSRaw(host, port, timeout)
 	if err2 != nil {
-		// Can't do comparison — use single probe result
-		if err1 != nil && len(resp1) == 0 {
-			return []ProbeResult{{Protocol: "Trojan", Transport: "TLS", Confidence: 45}}
-		}
+		// Can't do comparison — only report if we got positive HTTP fallback evidence
 		if len(resp1) > 0 && strings.Contains(string(resp1), "HTTP/") {
-			// Got HTTP fallback response — strong Trojan signal
-			return []ProbeResult{{Protocol: "Trojan", Transport: "TLS", Confidence: 70}}
+			return []ProbeResult{{Protocol: "Trojan", Transport: "TLS", Confidence: 65}}
 		}
-		return nil
+		return nil // No corroborating evidence — don't report
 	}
 	defer conn2.Close()
 
@@ -77,10 +73,8 @@ func probeTrojan(host, port string, timeout time.Duration) []ProbeResult {
 		return []ProbeResult{{Protocol: "Trojan", Transport: "TLS", Confidence: 75}}
 	}
 	if !hasHTTP1 && !hasHTTP2 {
-		// Neither works — could be Trojan without fallback, or non-HTTP TLS service
-		if err1 != nil {
-			return []ProbeResult{{Protocol: "Trojan", Transport: "TLS", Confidence: 40}}
-		}
+		// Neither works — no corroborating evidence, don't report
+		return nil
 	}
 	return nil
 }
@@ -116,16 +110,11 @@ func probeVLESS(host, port string, timeout time.Duration) []ProbeResult {
 	conn.SetWriteDeadline(time.Now().Add(shortTimeout))
 	conn.Write(header)
 
-	start := time.Now()
 	resp, err := readWithTimeout(conn, shortTimeout)
-	elapsed := time.Since(start)
 
 	if len(resp) == 0 && err != nil {
-		// Connection closed with no data — consistent with VLESS invalid UUID
-		if elapsed < shortTimeout/2 {
-			return []ProbeResult{{Protocol: "VLESS", Transport: "TLS", Confidence: 60}}
-		}
-		return []ProbeResult{{Protocol: "VLESS", Transport: "TLS", Confidence: 45}}
+		// Connection closed with no data — too ambiguous without corroborating evidence
+		return nil
 	}
 
 	if len(resp) > 0 {
@@ -160,12 +149,11 @@ func probeVMessTLS(host, port string, timeout time.Duration) []ProbeResult {
 	conn.SetWriteDeadline(time.Now().Add(shortTimeout))
 	conn.Write(payload)
 
-	start := time.Now()
 	resp, err := readWithTimeout(conn, shortTimeout)
-	elapsed := time.Since(start)
 
-	if len(resp) == 0 && err != nil && elapsed < shortTimeout/2 {
-		return []ProbeResult{{Protocol: "VMess", Transport: "TLS", Confidence: 50}}
+	if len(resp) == 0 && err != nil {
+		// Timeout/close only — too ambiguous, don't report
+		return nil
 	}
 	if len(resp) > 0 && ShannonEntropy(resp) > 7.5 {
 		return []ProbeResult{{Protocol: "VMess", Transport: "TLS", Confidence: 45}}
@@ -194,7 +182,8 @@ func probeSSTLS(host, port string, timeout time.Duration) []ProbeResult {
 
 	resp, err := readWithTimeout(conn, shortTimeout)
 	if len(resp) == 0 && err != nil {
-		return []ProbeResult{{Protocol: "Shadowsocks", Transport: "TLS", Confidence: 45}}
+		// Timeout/close only — too ambiguous, don't report
+		return nil
 	}
 	if len(resp) > 0 && ShannonEntropy(resp) > 7.5 {
 		return []ProbeResult{{Protocol: "Shadowsocks", Transport: "TLS", Confidence: 40}}

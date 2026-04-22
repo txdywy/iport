@@ -43,16 +43,22 @@ func release() {
 }
 
 // Singleton HTTP transport — reused across all CheckHTTP calls.
-var sharedHTTPClient = &http.Client{
-	Transport: &http.Transport{
+var sharedHTTPClient *http.Client
+
+func init() {
+	tr := &http.Transport{
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:      100,
-		IdleConnTimeout:   30 * time.Second,
-		DisableKeepAlives: false,
-	},
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse // don't follow redirects
-	},
+		ForceAttemptHTTP2:  true,
+		MaxIdleConns:       100,
+		IdleConnTimeout:    30 * time.Second,
+		DisableKeepAlives:  false,
+	}
+	sharedHTTPClient = &http.Client{
+		Transport: tr,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 func TLSVersionName(v uint16) string {
@@ -258,10 +264,9 @@ func doHTTPGet(scheme, urlHost string, timeout time.Duration) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer func() {
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}()
+	// Drain body (capped at 1MB to prevent infinite streams) BEFORE context cancel
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
 
 	proto := resp.Proto
 	if resp.TLS != nil && resp.TLS.NegotiatedProtocol != "" {

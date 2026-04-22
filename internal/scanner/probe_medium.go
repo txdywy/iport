@@ -109,12 +109,12 @@ func probeVMess(host, port string, timeout time.Duration) []ProbeResult {
 	elapsed := time.Since(start)
 
 	if n == 0 && err != nil {
-		// VMess with invalid auth: reads exactly 16 bytes for auth check, then closes
-		// Distinguish from SS: VMess tends to close slightly faster after auth check
-		if elapsed < shortTimeout/2 {
-			return []ProbeResult{{Protocol: "VMess", Transport: "TCP", Confidence: 50}}
+		// VMess with invalid auth: silent close — but too ambiguous alone
+		// Only report if timing is distinctively fast (< 200ms)
+		if elapsed < 200*time.Millisecond {
+			return []ProbeResult{{Protocol: "VMess", Transport: "TCP", Confidence: 35}}
 		}
-		return []ProbeResult{{Protocol: "VMess", Transport: "TCP", Confidence: 35}}
+		return nil
 	}
 
 	if n > 0 && ShannonEntropy(resp[:n]) > 7.5 {
