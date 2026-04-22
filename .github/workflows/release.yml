@@ -1,0 +1,82 @@
+name: Release iport
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.version.outputs.new_tag }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: '0'
+
+      - name: Bump version and push tag
+        id: version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch
+          create_annotated_tag: true
+
+  release:
+    needs: bump-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build and Package
+        run: |
+          mkdir -p dist
+
+          # Linux amd64
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/iport-linux-amd64 ./cmd/iport
+
+          # Linux arm64
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/iport-linux-arm64 ./cmd/iport
+
+          # macOS amd64
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o dist/iport-darwin-amd64 ./cmd/iport
+
+          # macOS arm64 (Apple Silicon)
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dist/iport-darwin-arm64 ./cmd/iport
+
+          # Windows amd64
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/iport-windows-amd64.exe ./cmd/iport
+
+          # Windows arm64
+          GOOS=windows GOARCH=arm64 go build -ldflags="-s -w" -o dist/iport-windows-arm64.exe ./cmd/iport
+
+          cd dist
+          tar -czvf iport-linux-amd64.tar.gz iport-linux-amd64
+          tar -czvf iport-linux-arm64.tar.gz iport-linux-arm64
+          tar -czvf iport-darwin-amd64.tar.gz iport-darwin-amd64
+          tar -czvf iport-darwin-arm64.tar.gz iport-darwin-arm64
+          zip iport-windows-amd64.zip iport-windows-amd64.exe
+          zip iport-windows-arm64.zip iport-windows-arm64.exe
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.bump-version.outputs.new_tag }}
+          name: Release ${{ needs.bump-version.outputs.new_tag }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
