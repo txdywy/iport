@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/fatih/color"
 	"github.com/txdywy/iport/internal/webcheck"
@@ -330,13 +331,14 @@ func printAttempts(attempts []webcheck.Attempt) {
 }
 
 func fit(s string, n int) string {
-	if len(s) <= n {
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
+	runes := []rune(s)
 	if n <= 1 {
-		return s[:n]
+		return string(runes[:n])
 	}
-	return s[:n-1] + "…"
+	return string(runes[:n-1]) + "…"
 }
 
 func verdictIcon(v webcheck.Verdict) string {

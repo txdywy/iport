@@ -64,9 +64,8 @@ func AnalyzeTLS(host, port string, timeout time.Duration) (*TLSInfo, error) {
 }
 
 // computeJA3S generates a simplified JA3S-like hash from the server's TLS state.
+// Standard JA3S uses MD5; we use truncated SHA-256 instead.
 func computeJA3S(state tls.ConnectionState) string {
-	// JA3S = md5(TLSVersion,CipherSuite,Extensions)
-	// We use sha256 truncated for a simpler fingerprint
 	raw := fmt.Sprintf("%d,%d,%s", state.Version, state.CipherSuite, state.NegotiatedProtocol)
 	h := sha256.Sum256([]byte(raw))
 	return fmt.Sprintf("%x", h[:12])

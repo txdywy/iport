@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -154,8 +155,12 @@ func makeWSFrame(payload []byte) []byte {
 	l := len(payload)
 	if l < 126 {
 		frame = append(frame, byte(l)|0x80) // masked
-	} else {
+	} else if l < 65536 {
 		frame = append(frame, 126|0x80, byte(l>>8), byte(l))
+	} else {
+		frame = append(frame, 127|0x80,
+			0, 0, 0, 0,
+			byte(l>>24), byte(l>>16), byte(l>>8), byte(l))
 	}
 	// Mask key
 	mask := make([]byte, 4)
@@ -189,7 +194,8 @@ func extractWSPayload(frame []byte) []byte {
 	if payloadLen <= 0 {
 		return nil
 	}
-	data := frame[offset : offset+payloadLen]
+	data := make([]byte, payloadLen)
+	copy(data, frame[offset:offset+payloadLen])
 	if masked && offset >= 6 {
 		mask := frame[offset-4 : offset]
 		for i := range data {
@@ -218,6 +224,7 @@ func probeGRPC(host, port string, timeout time.Duration) []ProbeResult {
 		if err != nil {
 			continue
 		}
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 
 		if resp.Header.Get("Content-Type") == "application/grpc" ||
@@ -238,14 +245,24 @@ func probeGRPC(host, port string, timeout time.Duration) []ProbeResult {
 // Uses independent connection per path to avoid corrupted state.
 func probeHTTPUpgrade(host, port string, timeout time.Duration) []ProbeResult {
 	for _, path := range []string{"/", "/httpupgrade", "/upgrade"} {
-		conn, err := dialTLSRaw(host, port, timeout)
+		var conn net.Conn
+		tlsConn, err := dialTLSRaw(host, port, timeout)
 		if err != nil {
-			return nil
+			conn, err = net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+			if err != nil {
+				continue
+			}
+		} else {
+			conn = tlsConn
 		}
 		conn.SetDeadline(time.Now().Add(timeout))
 
-		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-			path, HostForHTTP(host))
+		keyBytes := make([]byte, 16)
+		rand.Read(keyBytes)
+		wsKey := base64.StdEncoding.EncodeToString(keyBytes)
+
+		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
+			path, HostForHTTP(host), wsKey)
 		conn.Write([]byte(req))
 
 		reader := bufio.NewReader(conn)
@@ -284,6 +301,7 @@ func probeXHTTP(host, port string, timeout time.Duration) []ProbeResult {
 		}
 		ct := resp.Header.Get("Content-Type")
 		te := resp.Header.Get("Transfer-Encoding")
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 
 		// XHTTP signals: accepts POST with octet-stream, returns chunked/streaming

@@ -3,6 +3,7 @@ package scanner
 import (
 	"bufio"
 	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strings"
@@ -80,7 +81,9 @@ func probeObfs4(host, port string, timeout time.Duration) []ProbeResult {
 	// obfs4 client handshake: 32-byte Elligator2 representative + HMAC + padding
 	// Total size: 8192 bytes max, minimum ~96 bytes
 	// Send a probe that mimics the size range
-	probeSize := 96 + (int(time.Now().UnixNano()) % 128) // 96-224 bytes
+	var rndByte [1]byte
+	rand.Read(rndByte[:])
+	probeSize := 96 + int(rndByte[0])%128
 	payload := make([]byte, probeSize)
 	rand.Read(payload)
 
@@ -137,7 +140,10 @@ func probeBrookWS(host, port string, timeout time.Duration) []ProbeResult {
 	conn.SetDeadline(time.Now().Add(timeout))
 
 	// Brook WSS uses WebSocket upgrade to /ws path
-	req := fmt.Sprintf("GET /ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", HostForHTTP(host))
+	keyBytes := make([]byte, 16)
+	rand.Read(keyBytes)
+	wsKey := base64.StdEncoding.EncodeToString(keyBytes)
+	req := fmt.Sprintf("GET /ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", HostForHTTP(host), wsKey)
 	conn.Write([]byte(req))
 
 	reader := bufio.NewReader(conn)

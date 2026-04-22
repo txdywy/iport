@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -90,6 +91,9 @@ func CheckTCP(host, port string, timeout time.Duration) error {
 	return nil
 }
 
+// ErrUDPOpenFiltered indicates a UDP port that received no response (open or filtered).
+var ErrUDPOpenFiltered = errors.New("timeout (open|filtered)")
+
 // CheckUDP sends a packet to a UDP port and waits for an ICMP unreachable.
 func CheckUDP(host, port string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -110,7 +114,7 @@ func CheckUDP(host, port string, timeout time.Duration) error {
 	_, err = conn.Read(buffer)
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return fmt.Errorf("timeout (open|filtered)")
+			return ErrUDPOpenFiltered
 		}
 		return err
 	}

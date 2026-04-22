@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -21,7 +22,7 @@ var Version = "dev"
 
 // ScanResult is the decoupled result type — scanner produces, UI consumes.
 type ScanResult struct {
-	Kind        string // "section", "result", "proxy", "proxy-summary", "progress", "clear-progress", "ports"
+	Kind        string // "section", "result", "proxy", "proxy-summary", "progress", "clear-progress", "ports", "batch"
 	Name        string
 	Err         error
 	Extra       string
@@ -30,6 +31,7 @@ type ScanResult struct {
 	Probes      []ui.ProbeDisplay
 	AllProbes   map[string][]ui.ProbeDisplay
 	Total, Done int
+	Batch       []ScanResult
 }
 
 func isFlagPassed(name string) bool {
@@ -159,7 +161,7 @@ func main() {
 	uiDone.Add(1)
 	go func() {
 		defer uiDone.Done()
-		for r := range results {
+		handle := func(r ScanResult) {
 			switch r.Kind {
 			case "section":
 				ui.PrintSection(r.Name)
@@ -177,22 +179,23 @@ func main() {
 				ui.ClearProgress()
 			}
 		}
+		for r := range results {
+			if r.Kind == "batch" {
+				for _, sub := range r.Batch {
+					handle(sub)
+				}
+			} else {
+				handle(r)
+			}
+		}
 	}()
 
-	var emitMu sync.Mutex
 	emit := func(r ScanResult) {
-		emitMu.Lock()
-		defer emitMu.Unlock()
 		results <- r
 	}
 
-	// emitBatch sends multiple results atomically — no interleaving from other goroutines.
 	emitBatch := func(batch []ScanResult) {
-		emitMu.Lock()
-		defer emitMu.Unlock()
-		for _, r := range batch {
-			results <- r
-		}
+		results <- ScanResult{Kind: "batch", Batch: batch}
 	}
 
 	ui.PrintHeader(target)
@@ -262,8 +265,7 @@ func main() {
 
 				if scanUDP {
 					udpErr := scanner.CheckUDP(target, port, timeout)
-					if udpErr != nil && strings.Contains(udpErr.Error(), "timeout") {
-						// open|filtered — possible UDP service; summarize in big scans.
+					if errors.Is(udpErr, scanner.ErrUDPOpenFiltered) {
 						portsMu.Lock()
 						openUDPFilteredPorts = append(openUDPFilteredPorts, port)
 						portsMu.Unlock()
@@ -271,7 +273,7 @@ func main() {
 							portsMu.Lock()
 							openUDPPorts = append(openUDPPorts, port)
 							portsMu.Unlock()
-							emit(ScanResult{Kind: "result", Name: fmt.Sprintf("UDP Port %s", port), Err: fmt.Errorf("timeout (open|filtered)")})
+							emit(ScanResult{Kind: "result", Name: fmt.Sprintf("UDP Port %s", port), Err: scanner.ErrUDPOpenFiltered})
 						}
 					} else if udpErr == nil {
 						portsMu.Lock()
