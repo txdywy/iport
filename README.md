@@ -38,14 +38,17 @@ go install github.com/txdywy/iport/cmd/iport@latest
 ## Usage
 
 ```bash
-# Basic usage (defaults to scanning ports 80 and 443 with proxy detection)
+# Basic usage (defaults to scanning ports 80 and 443, TCP+UDP)
 iport example.com
 
 # Specify custom ports
 iport 192.168.1.100 -p 80,443,8080,8443
 
-# TCP only (skip UDP scanning and HTTP/3 check)
+# TCP only
 iport example.com -T
+
+# UDP only
+iport example.com -U
 
 # Proxy detection only (skip TLS/HTTP analysis for speed)
 iport 192.168.1.100 -p 443,1080,8388 -probe-only
@@ -57,9 +60,6 @@ iport example.com -probe=false
 iport -list-probes
 
 # Scan all 65535 TCP+UDP ports (proxy detection auto-disabled for performance)
-iport example.com -A -U
-
-# Scan all ports, TCP only
 iport example.com -A
 
 # Adjust timeout (in milliseconds)
@@ -76,9 +76,9 @@ iport example.com -A -c 2000
 | `-t` | | Target IP or domain |
 | `-p` | `80,443` | Ports to scan (comma separated, validated 1-65535) |
 | `-timeout` | `2000` | Timeout in milliseconds |
-| `-A` | `false` | Scan all 65535 ports (TCP only; add -U for UDP) |
-| `-T` | `false` | TCP only, skip UDP scanning and HTTP/3 |
-| `-U` | `false` | Include UDP scanning (use with -A for full TCP+UDP) |
+| `-A` | `false` | Scan all 65535 ports (TCP+UDP) |
+| `-T` | `false` | TCP only (default: TCP+UDP) |
+| `-U` | `false` | UDP only (default: TCP+UDP) |
 | `-c` | `1000` | Maximum concurrent scans |
 | `-probe` | `true` | Enable proxy protocol detection |
 | `-probe-only` | `false` | Skip TLS/HTTP, only run proxy probes |

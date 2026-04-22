@@ -55,9 +55,9 @@ func main() {
 	flag.StringVar(&ports, "p", "", "Ports to scan (comma separated, default: 80,443)")
 	flag.IntVar(&timeoutMs, "timeout", 2000, "Timeout in milliseconds")
 	flag.BoolVar(&showVersion, "V", false, "Show version and exit")
-	flag.BoolVar(&allPorts, "A", false, "Scan all 65535 ports (TCP+UDP, equivalent to -T -U)")
-	flag.BoolVar(&tcpOnly, "T", false, "Enable TCP scanning")
-	flag.BoolVar(&udpScan, "U", false, "Enable UDP scanning")
+	flag.BoolVar(&allPorts, "A", false, "Scan all 65535 ports (TCP+UDP)")
+	flag.BoolVar(&tcpOnly, "T", false, "TCP only (default: TCP+UDP)")
+	flag.BoolVar(&udpScan, "U", false, "UDP only (default: TCP+UDP)")
 	flag.IntVar(&concurrency, "c", 1000, "Maximum concurrent scans")
 	flag.BoolVar(&probeProxy, "probe", true, "Enable proxy protocol detection")
 	flag.BoolVar(&probeOnly, "probe-only", false, "Skip TLS/HTTP, only run proxy probes")
@@ -116,26 +116,18 @@ func main() {
 	}
 
 	// Scan mode:
-	// -T = TCP, -U = UDP, -T -U = both, -A = all ports TCP+UDP
-	// No -T/-U/-A = default TCP+UDP on specified ports
+	// Default (no flags): TCP+UDP on specified ports
+	// -T: TCP only, -U: UDP only, -T -U: both
+	// -A: all 65535 ports, always TCP+UDP
 	scanTCP := true
 	scanUDP := true
 	if tcpOnly || udpScan {
-		// Explicit mode: only scan what's requested
 		scanTCP = tcpOnly
 		scanUDP = udpScan
 	}
 	if allPorts {
-		// -A = all ports, implies both TCP+UDP
 		scanTCP = true
 		scanUDP = true
-		// But respect -T/-U if explicitly given with -A
-		if tcpOnly && !udpScan {
-			scanUDP = false
-		}
-		if udpScan && !tcpOnly {
-			scanTCP = false
-		}
 	}
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	bigScan := len(portList) > 100
@@ -360,6 +352,26 @@ func main() {
 			}(port)
 		}
 		wg.Wait()
+
+		// HTTP/3 check on open UDP ports (for -U mode where TCP ports aren't scanned)
+		if !scanTCP && scanUDP {
+			for _, port := range openUDPPorts {
+				wg.Add(1)
+				go func(port string) {
+					defer wg.Done()
+					err := scanner.CheckHTTP3(target, port, timeout)
+					r := ScanResult{Kind: "result", Name: "HTTP/3 (QUIC/UDP)", Err: err}
+					if err == nil {
+						r.Extra = "Supported"
+					}
+					emitBatch([]ScanResult{
+						{Kind: "section", Name: fmt.Sprintf("Application Layer (L7) (UDP Port %s)", port)},
+						r,
+					})
+				}(port)
+			}
+			wg.Wait()
+		}
 	}
 
 	// ========== Phase 4: Proxy Protocol Detection ==========
