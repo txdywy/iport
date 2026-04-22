@@ -1,6 +1,6 @@
-module github.com/yiwei/iport
+module github.com/txdywy/iport
 
-go 1.26.2
+go 1.22.2
 
 require (
 	github.com/fatih/color v1.19.0

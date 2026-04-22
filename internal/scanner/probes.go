@@ -4,14 +4,15 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
-	"github.com/quic-go/quic-go"
 )
 
 const (
@@ -47,7 +48,7 @@ func CheckTCP(host string, port string, timeout time.Duration) error {
 	return nil
 }
 
-// CheckUDP attempts to send an empty packet to a UDP port and waits for an ICMP unreachable
+// CheckUDP attempts to send a packet to a UDP port and waits for an ICMP unreachable.
 // Note: This is a basic UDP check. Many firewalls silently drop UDP packets.
 func CheckUDP(host string, port string, timeout time.Duration) error {
 	target := net.JoinHostPort(host, port)
@@ -57,22 +58,17 @@ func CheckUDP(host string, port string, timeout time.Duration) error {
 	}
 	defer conn.Close()
 
-	// Send an empty packet
-	_, err = conn.Write([]byte(""))
-	if err != nil {
+	// Send a single-byte packet (empty write may be a no-op on some systems)
+	if _, err = conn.Write([]byte{0}); err != nil {
 		return err
 	}
 
-	// Set read deadline
 	conn.SetReadDeadline(time.Now().Add(timeout))
 
-	// Try to read anything back. If it's a timeout, it might be open but silently dropping,
-	// or filtered. If we get connection refused, it's definitively closed.
 	buffer := make([]byte, 1024)
 	_, err = conn.Read(buffer)
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			// Timeout is often the best we get for an open or filtered UDP port
 			return fmt.Errorf("timeout (open|filtered)")
 		}
 		return err
@@ -81,11 +77,10 @@ func CheckUDP(host string, port string, timeout time.Duration) error {
 }
 
 // Ping sends an ICMP Echo Request
-func Ping(host string, timeout time.Duration) (error, time.Duration) {
-	// Resolve IP
+func Ping(host string, timeout time.Duration) (time.Duration, error) {
 	ips, err := net.LookupIP(host)
 	if err != nil {
-		return err, 0
+		return 0, err
 	}
 
 	var ip net.IP
@@ -96,12 +91,12 @@ func Ping(host string, timeout time.Duration) (error, time.Duration) {
 		}
 	}
 	if ip == nil {
-		return fmt.Errorf("no IPv4 address found"), 0
+		return 0, fmt.Errorf("no IPv4 address found")
 	}
 
 	c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
-		return fmt.Errorf("icmp listen requires root privileges"), 0
+		return 0, fmt.Errorf("icmp listen requires root privileges")
 	}
 	defer c.Close()
 
@@ -114,40 +109,38 @@ func Ping(host string, timeout time.Duration) (error, time.Duration) {
 	}
 	wb, err := wm.Marshal(nil)
 	if err != nil {
-		return err, 0
+		return 0, err
 	}
 
 	start := time.Now()
 	if _, err := c.WriteTo(wb, &net.IPAddr{IP: ip}); err != nil {
-		return err, 0
+		return 0, err
 	}
 
 	c.SetReadDeadline(time.Now().Add(timeout))
 	rb := make([]byte, 1500)
 	n, _, err := c.ReadFrom(rb)
 	if err != nil {
-		return fmt.Errorf("timeout"), 0
+		return 0, fmt.Errorf("timeout")
 	}
 	rtt := time.Since(start)
 
 	rm, err := icmp.ParseMessage(ipv4.ICMPTypeEchoReply.Protocol(), rb[:n])
 	if err != nil {
-		return err, 0
+		return 0, err
 	}
-	switch rm.Type {
-	case ipv4.ICMPTypeEchoReply:
-		return nil, rtt
-	default:
-		return fmt.Errorf("unexpected ICMP type: %v", rm.Type), 0
+	if rm.Type == ipv4.ICMPTypeEchoReply {
+		return rtt, nil
 	}
+	return 0, fmt.Errorf("unexpected ICMP type: %v", rm.Type)
 }
 
 // CheckTLS checks if a specific TLS version is supported
-func CheckTLS(host string, port string, version uint16, timeout time.Duration) (error, string) {
+func CheckTLS(host string, port string, version uint16, timeout time.Duration) (string, error) {
 	target := net.JoinHostPort(host, port)
 
 	conf := &tls.Config{
-		InsecureSkipVerify: true, // We just want to check support, not validate cert
+		InsecureSkipVerify: true,
 		MinVersion:         version,
 		MaxVersion:         version,
 		ServerName:         host,
@@ -156,47 +149,65 @@ func CheckTLS(host string, port string, version uint16, timeout time.Duration) (
 	dialer := &net.Dialer{Timeout: timeout}
 	conn, err := tls.DialWithDialer(dialer, "tcp", target, conf)
 	if err != nil {
-		return err, ""
+		return "", err
 	}
 	defer conn.Close()
 
 	state := conn.ConnectionState()
-	return nil, tls.CipherSuiteName(state.CipherSuite)
+	return tls.CipherSuiteName(state.CipherSuite), nil
 }
 
 // CheckHTTP checks standard HTTP/HTTPS and ALPN negotiation
-func CheckHTTP(host string, port string, timeout time.Duration) (error, string) {
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
+func CheckHTTP(host string, port string, timeout time.Duration) (string, error) {
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	defer tr.CloseIdleConnections()
+
+	client := &http.Client{Timeout: timeout, Transport: tr}
+
+	// Determine scheme based on port
+	scheme := "https"
+	if port == "80" {
+		scheme = "http"
 	}
 
-	target := net.JoinHostPort(host, port)
-
-	// If it's a standard web port, we might not need the port in the URL
 	urlHost := host
 	if port != "80" && port != "443" {
-		urlHost = target
+		urlHost = net.JoinHostPort(host, port)
 	}
 
-	resp, err := client.Get("https://" + urlHost)
+	resp, err := client.Get(scheme + "://" + urlHost)
 	if err != nil {
-		// Fallback to HTTP if HTTPS fails
-		resp, err = client.Get("http://" + urlHost)
-		if err != nil {
-			return err, ""
+		if resp != nil {
+			resp.Body.Close()
+		}
+		// Fallback: try the other scheme for non-standard ports
+		if port != "80" && port != "443" {
+			alt := "http"
+			if scheme == "http" {
+				alt = "https"
+			}
+			resp, err = client.Get(alt + "://" + urlHost)
+			if err != nil {
+				if resp != nil {
+					resp.Body.Close()
+				}
+				return "", err
+			}
+		} else {
+			return "", err
 		}
 	}
 	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
 
 	proto := resp.Proto
 	if resp.TLS != nil && resp.TLS.NegotiatedProtocol != "" {
 		proto = resp.TLS.NegotiatedProtocol
 	}
 
-	return nil, fmt.Sprintf("%s (Status: %d)", proto, resp.StatusCode)
+	return fmt.Sprintf("%s (Status: %d)", proto, resp.StatusCode), nil
 }
 
 // CheckHTTP3 checks QUIC / HTTP3 support
@@ -208,15 +219,13 @@ func CheckHTTP3(host string, port string, timeout time.Duration) error {
 		NextProtos:         []string{"h3"},
 	}
 
-	// Try QUIC dial
-	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	conn, err := quic.DialAddr(ctx, target, tlsConf, &quic.Config{})
 	if err != nil {
 		return err
 	}
-	conn.CloseWithError(0, "")
+	defer conn.CloseWithError(0, "")
 	return nil
 }

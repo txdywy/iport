@@ -4,28 +4,53 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/yiwei/iport/internal/scanner"
-	"github.com/yiwei/iport/internal/ui"
+	"github.com/txdywy/iport/internal/scanner"
+	"github.com/txdywy/iport/internal/ui"
+)
+
+var (
+	Version = "dev"
 )
 
 func main() {
+	// Workaround for Go's flag package stopping on the first non-flag argument.
+	// This allows usage like `iport example.com -p 80`.
+	// Limitation: targets starting with "-" are not supported.
+	if len(os.Args) > 2 && !strings.HasPrefix(os.Args[1], "-") {
+		arg := os.Args[1]
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		os.Args = append(os.Args, arg)
+	}
+
 	var target string
 	var ports string
 	var timeoutMs int
+	var showVersion bool
+	var allPorts bool
+	var concurrency int
 
 	flag.StringVar(&target, "t", "", "Target IP or domain (e.g., example.com, 192.168.1.1)")
 	flag.StringVar(&ports, "p", "", "Ports to scan (comma separated). If not provided, defaults to 80,443")
 	flag.IntVar(&timeoutMs, "timeout", 2000, "Timeout in milliseconds for each probe")
+	flag.BoolVar(&showVersion, "V", false, "Show version and exit")
+	flag.BoolVar(&allPorts, "A", false, "Scan all 65535 TCP ports")
+	flag.IntVar(&concurrency, "c", 1000, "Maximum concurrent port scans")
 	flag.Parse()
 
-	// If target is not provided via flag, check positional argument
+	if showVersion {
+		fmt.Printf("iport version %s\n", Version)
+		os.Exit(0)
+	}
+
 	if target == "" {
-		args := flag.Args()
-		if len(args) > 0 {
+		if args := flag.Args(); len(args) > 0 {
 			target = args[0]
 		}
 	}
@@ -36,64 +61,128 @@ func main() {
 		os.Exit(1)
 	}
 
-	if ports == "" {
-		ports = "80,443"
+	var portList []string
+	if allPorts {
+		portList = make([]string, 65535)
+		for i := range portList {
+			portList[i] = strconv.Itoa(i + 1)
+		}
+	} else {
+		if ports == "" {
+			ports = "80,443"
+		}
+		portList = strings.Split(ports, ",")
+		for i := range portList {
+			portList[i] = strings.TrimSpace(portList[i])
+		}
 	}
 
-	portList := strings.Split(ports, ",")
 	timeout := time.Duration(timeoutMs) * time.Millisecond
+	bigScan := len(portList) > 100
 
 	ui.PrintHeader(target)
 
-	var wg sync.WaitGroup
-
-	// Phase 1: Basic Connectivity (ICMP, TCP)
+	// Phase 1: Basic Connectivity
 	ui.PrintSection("L3/L4 Basic Connectivity")
+
+	var wg sync.WaitGroup
 
 	// ICMP
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err, rtt := scanner.Ping(target, timeout)
+		rtt, err := scanner.Ping(target, timeout)
 		ui.PrintResult("ICMP Ping", err, fmt.Sprintf("RTT: %v", rtt))
 	}()
 
-	// TCP and UDP Ports
-	for _, p := range portList {
-		wg.Add(1)
-		port := strings.TrimSpace(p)
-		go func(port string) {
-			defer wg.Done()
-			err := scanner.CheckTCP(target, port, timeout)
-			ui.PrintResult(fmt.Sprintf("TCP Port %s", port), err, "Open")
-		}(port)
+	// TCP/UDP port scanning with worker pool
+	var openTCPPorts []string
+	var openPortsMu sync.Mutex
 
-		wg.Add(1)
-		go func(port string) {
-			defer wg.Done()
-			err := scanner.CheckUDP(target, port, timeout)
-			// For UDP, timeout often means it's open but ignoring us, or filtered.
-			if err != nil && strings.Contains(err.Error(), "timeout") {
-				ui.PrintResult(fmt.Sprintf("UDP Port %s", port), fmt.Errorf("timeout (open|filtered)"), "")
-			} else {
-				ui.PrintResult(fmt.Sprintf("UDP Port %s", port), err, "Open")
+	type portJob struct{ port string }
+	jobs := make(chan portJob, concurrency)
+
+	var scannedPorts int32
+	var doneCh chan struct{}
+
+	// Progress indicator for large scans
+	if bigScan {
+		doneCh = make(chan struct{})
+		go func() {
+			total := len(portList)
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					p := atomic.LoadInt32(&scannedPorts)
+					ui.PrintProgress(total, int(p))
+				case <-doneCh:
+					ui.ClearProgress()
+					return
+				}
 			}
-		}(port)
+		}()
 	}
+
+	// Spawn workers
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				port := job.port
+				err := scanner.CheckTCP(target, port, timeout)
+				if err == nil {
+					openPortsMu.Lock()
+					openTCPPorts = append(openTCPPorts, port)
+					openPortsMu.Unlock()
+					if bigScan {
+						ui.ClearProgress()
+					}
+					ui.PrintResult(fmt.Sprintf("TCP Port %s", port), nil, "Open")
+				} else if !bigScan {
+					ui.PrintResult(fmt.Sprintf("TCP Port %s", port), err, "")
+				}
+
+				if !allPorts {
+					udpErr := scanner.CheckUDP(target, port, timeout)
+					if udpErr != nil && strings.Contains(udpErr.Error(), "timeout") {
+						if !bigScan {
+							ui.PrintResult(fmt.Sprintf("UDP Port %s", port), fmt.Errorf("timeout (open|filtered)"), "")
+						}
+					} else if udpErr == nil {
+						if bigScan {
+							ui.ClearProgress()
+						}
+						ui.PrintResult(fmt.Sprintf("UDP Port %s", port), nil, "Open")
+					} else if !bigScan {
+						ui.PrintResult(fmt.Sprintf("UDP Port %s", port), udpErr, "")
+					}
+				}
+
+				atomic.AddInt32(&scannedPorts, 1)
+			}
+		}()
+	}
+
+	// Feed jobs
+	for _, p := range portList {
+		jobs <- portJob{port: p}
+	}
+	close(jobs)
 
 	wg.Wait()
-
-	// Phase 2: TLS Detection (only on 443 for now)
-	has443 := false
-	for _, p := range portList {
-		if strings.TrimSpace(p) == "443" {
-			has443 = true
-			break
-		}
+	if doneCh != nil {
+		close(doneCh)
 	}
 
-	if has443 {
-		ui.PrintSection("TLS Detection (Port 443)")
+	// Sort open ports for deterministic output
+	sort.Strings(openTCPPorts)
+
+	// Phase 2 & 3: TLS Detection and Application Layer
+	for _, port := range openTCPPorts {
+		ui.PrintSection(fmt.Sprintf("TLS Detection (Port %s)", port))
 		tlsVersions := []uint16{
 			scanner.VersionTLS10,
 			scanner.VersionTLS11,
@@ -103,46 +192,42 @@ func main() {
 
 		for _, v := range tlsVersions {
 			wg.Add(1)
-			go func(version uint16) {
+			go func(version uint16, port string) {
 				defer wg.Done()
-				err, cipher := scanner.CheckTLS(target, "443", version, timeout)
+				cipher, err := scanner.CheckTLS(target, port, version, timeout)
 				name := scanner.TLSVersionName(version)
-
 				if err == nil {
 					ui.PrintResult(fmt.Sprintf("TLS %s", name), nil, fmt.Sprintf("Supported (Cipher: %s)", cipher))
 				} else {
 					ui.PrintResult(fmt.Sprintf("TLS %s", name), err, "")
 				}
-			}(v)
+			}(v, port)
 		}
 		wg.Wait()
 
-		// Phase 3: Application Layer (HTTP/1, H2, H3)
-		ui.PrintSection("Application Layer (L7)")
+		ui.PrintSection(fmt.Sprintf("Application Layer (L7) (Port %s)", port))
 
-		// HTTP/1 & H2
 		wg.Add(1)
-		go func() {
+		go func(port string) {
 			defer wg.Done()
-			err, proto := scanner.CheckHTTP(target, "443", timeout)
+			proto, err := scanner.CheckHTTP(target, port, timeout)
 			if err == nil {
 				ui.PrintResult("HTTP (over TCP)", nil, fmt.Sprintf("Negotiated: %s", proto))
 			} else {
 				ui.PrintResult("HTTP (over TCP)", err, "")
 			}
-		}()
+		}(port)
 
-		// HTTP/3 (QUIC)
 		wg.Add(1)
-		go func() {
+		go func(port string) {
 			defer wg.Done()
-			err := scanner.CheckHTTP3(target, "443", timeout)
+			err := scanner.CheckHTTP3(target, port, timeout)
 			if err == nil {
 				ui.PrintResult("HTTP/3 (QUIC/UDP)", nil, "Supported")
 			} else {
 				ui.PrintResult("HTTP/3 (QUIC/UDP)", err, "")
 			}
-		}()
+		}(port)
 
 		wg.Wait()
 	}
